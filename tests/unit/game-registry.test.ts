@@ -39,6 +39,16 @@ const cases = [
       livesRemaining: 2,
     }),
   },
+  {
+    code: 'flappy-bird',
+    config: { target: 2, gap: 120, speed: 2.4 },
+    result: (challenge: Record<string, unknown>) => ({
+      challengeToken: challenge.challengeToken,
+      achieved: 2,
+      score: 2,
+      actions: ['flap', 'pass:0', 'flap', 'pass:1'],
+    }),
+  },
 ] as const;
 
 describe('arcade game validators', () => {
@@ -93,16 +103,17 @@ describe('deterministic game validators', () => {
     ).toBe(true);
   });
 
-  it('validates the server-held chess solution', () => {
-    const module = gameRegistry.get('chess-puzzle')!;
-    const challenge = module.createChallenge({ moves: 1 }, 'easy');
-    expect(
-      module.validate({}, challenge.publicData, challenge.secretData, {
-        challengeToken: challenge.publicData.challengeToken,
-        moves: challenge.secretData.solution,
-      }).passed,
-    ).toBe(true);
-  });
+  // chess-puzzle commented out per request - replaced by Flappy Bird
+  // it('validates the server-held chess solution', () => {
+  //   const module = gameRegistry.get('chess-puzzle')!;
+  //   const challenge = module.createChallenge({ moves: 1 }, 'easy');
+  //   expect(
+  //     module.validate({}, challenge.publicData, challenge.secretData, {
+  //       challengeToken: challenge.publicData.challengeToken,
+  //       moves: challenge.secretData.solution,
+  //     }).passed,
+  //   ).toBe(true);
+  // });
 
   it('replays number merge moves instead of trusting a claimed board', () => {
     const module = gameRegistry.get('number-merge')!;
@@ -130,7 +141,7 @@ describe('deterministic game validators', () => {
 it('registers exactly the eight supported game codes', () => {
   expect([...gameRegistry.keys()].sort()).toEqual([
     'brick-breaker',
-    'chess-puzzle',
+    'flappy-bird',
     'memory-match',
     'number-merge',
     'pattern-recall',

@@ -1,6 +1,8 @@
 import { HttpError } from '../../utils/http-error.js';
 import { brickBreakerModule } from './brick-breaker/brick-breaker.validator.js';
-import { chessPuzzleModule } from './chess-puzzle/chess-puzzle.validator.js';
+// Chess puzzle commented out per request - replaced by Flappy Bird
+// import { chessPuzzleModule } from './chess-puzzle/chess-puzzle.validator.js';
+import { flappyBirdModule } from './flappy-bird/flappy-bird.validator.js';
 import type { GameModule } from './shared/game.types.js';
 import { memoryMatchModule } from './memory-match/memory-match.validator.js';
 import { numberMergeModule } from './number-merge/number-merge.validator.js';
@@ -15,7 +17,8 @@ export const gameRegistry = new Map<string, GameModule>(
     snakeModule,
     brickBreakerModule,
     memoryMatchModule,
-    chessPuzzleModule,
+    flappyBirdModule,
+    // chessPuzzleModule,
     numberMergeModule,
     spaceInvadersModule,
     patternRecallModule,
