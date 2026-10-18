@@ -8,7 +8,7 @@ ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name;
 
 WITH level_values(code, difficulty, config) AS (
   VALUES
-    ('tetris','easy','{"target":2,"speed":700}'::jsonb), ('tetris','medium','{"target":4,"speed":550}'::jsonb), ('tetris','hard','{"target":6,"speed":400}'::jsonb),
+    ('tetris','easy','{"target":4,"speed":550}'::jsonb), ('tetris','medium','{"target":6,"speed":400}'::jsonb), ('tetris','hard','{"target":8,"speed":280}'::jsonb),
     ('snake','easy','{"target":5,"obstacles":0}'::jsonb), ('snake','medium','{"target":10,"obstacles":2}'::jsonb), ('snake','hard','{"target":15,"obstacles":5}'::jsonb),
     ('brick-breaker','easy','{"target":8,"lives":5}'::jsonb), ('brick-breaker','medium','{"target":14,"lives":4}'::jsonb), ('brick-breaker','hard','{"target":20,"lives":3}'::jsonb),
     ('memory-match','easy','{"pairs":6}'::jsonb), ('memory-match','medium','{"pairs":8}'::jsonb), ('memory-match','hard','{"pairs":12}'::jsonb),
