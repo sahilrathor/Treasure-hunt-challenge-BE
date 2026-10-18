@@ -45,7 +45,11 @@ export const errorHandler: ErrorRequestHandler = (error: unknown, request, respo
     return;
   }
   request.log.error({ err: error }, 'Unhandled request error');
+  const message =
+    process.env.NODE_ENV !== 'production' && error instanceof Error
+      ? error.message
+      : 'An unexpected error occurred.';
   response
     .status(500)
-    .json({ error: { code: 'INTERNAL_ERROR', message: 'An unexpected error occurred.' } });
+    .json({ error: { code: 'INTERNAL_ERROR', message } });
 };

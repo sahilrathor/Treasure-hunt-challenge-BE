@@ -1,6 +1,15 @@
+import { resolve } from 'node:path';
 import { createApp } from './app.js';
 import { env } from './config/env.js';
 import { pool } from './db/pool.js';
+import { runSqlFiles } from './scripts/run-sql-files.js';
+
+// Auto-run schema migrations on startup to prevent schema divergence
+try {
+  await runSqlFiles(resolve('database/migrations'), 'schema_migrations');
+} catch (error) {
+  console.error('Failed to run schema migrations on startup:', error);
+}
 
 const app = createApp({
   allowedOrigin: env.FRONTEND_ORIGIN,
