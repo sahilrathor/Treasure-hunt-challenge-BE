@@ -1,0 +1,62 @@
+openapi: 3.1.0
+info:
+  title: College Fest Hunt API
+  version: 1.0.0
+servers:
+  - url: /api/v1
+paths:
+  /auth/login:
+    post:
+      summary: Authenticate a participant or administrator
+      responses:
+        '200': { description: Authenticated; sets an HttpOnly session cookie }
+        '401': { description: Invalid credentials }
+  /me:
+    get:
+      summary: Return the current identity
+      responses:
+        '200': { description: Current identity }
+        '401': { description: Unauthenticated }
+  /events/{eventId}/start:
+    post:
+      summary: Start a team's official clock once
+      parameters:
+        - { name: eventId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Team progress }
+        '409': { description: Invalid event/team state }
+  /checkpoints/scan:
+    post:
+      summary: Validate a QR token and return the stable round assignment
+      responses:
+        '200': { description: Assignment }
+        '409': { description: Wrong checkpoint or progression state }
+  /assignments/{assignmentId}/attempts:
+    post:
+      summary: Start an authoritative timed attempt
+      parameters:
+        - { name: assignmentId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string } }
+      responses:
+        '201': { description: Attempt started }
+        '429': { description: Cooldown active }
+  /attempts/{attemptId}/submit:
+    post:
+      summary: Validate and finalize an attempt result
+      parameters:
+        - { name: attemptId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Accepted authoritative result }
+        '422': { description: Malformed or invalid game evidence }
+  /leaderboard:
+    get:
+      summary: Return completed and incomplete team standings
+      responses:
+        '200': { description: Standings }
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: hunt_session
