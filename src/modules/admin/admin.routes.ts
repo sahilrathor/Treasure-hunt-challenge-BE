@@ -678,6 +678,7 @@ adminRouter.patch(
         label: z.string().min(2).max(120).optional(),
         active: z.boolean().optional(),
         rotateToken: z.boolean().optional(),
+        clue: z.string().trim().min(1).max(1000).optional(),
       })
       .parse(request.body);
     const token = input.rotateToken ? createToken(24) : null;
@@ -692,8 +693,16 @@ adminRouter.patch(
       throw new HttpError(
         409,
         'CHECKPOINT_NOT_EDITABLE',
-        'QR codes cannot be changed after the hunt is finished.',
+        'QR codes and checkpoints cannot be changed after the hunt is finished.',
       );
+
+    if (input.clue !== undefined) {
+      await query(
+        `UPDATE rounds SET clue=$2 WHERE checkpoint_id=$1 AND event_id=$3`,
+        [checkpointId, input.clue, result.rows[0].event_id],
+      );
+    }
+
     await audit(admin.userId, 'UPDATE', 'checkpoint', checkpointId, result.rows[0].event_id, input);
     response.json({
       data: {
@@ -704,6 +713,7 @@ adminRouter.patch(
               scanUrl: `${env.FRONTEND_ORIGIN}/scan?token=${encodeURIComponent(token)}`,
             }
           : {}),
+        ...(input.clue !== undefined ? { clue: input.clue } : {}),
       },
     });
   }),
@@ -806,6 +816,46 @@ adminRouter.post(
     });
 
     await audit(admin.userId, 'MAP_ROUND_GAMES', 'event', eventId, eventId, input);
+    response.json({ data: { updated: true } });
+  }),
+);
+
+adminRouter.post(
+  '/admin/events/:eventId/clues',
+  asyncRoute(async (request, response) => {
+    const admin = requireAdmin(request);
+    const eventId = uuid.parse(request.params.eventId);
+    const input = z
+      .object({
+        clues: z.array(
+          z.object({
+            roundId: uuid,
+            clue: z.string().trim().min(1).max(1000),
+          }),
+        ),
+      })
+      .parse(request.body);
+
+    await withTransaction(async (client) => {
+      const event = await client.query<{ id: string; status: string }>(
+        `SELECT id, status FROM events WHERE id=$1`,
+        [eventId],
+      );
+      if (!event.rows[0]) throw new HttpError(404, 'EVENT_NOT_FOUND', 'Event not found.');
+      if (event.rows[0].status === 'FINISHED')
+        throw new HttpError(409, 'EVENT_FINISHED', 'Cannot modify clues for a finished event.');
+
+      for (const item of input.clues) {
+        await client.query(
+          `UPDATE rounds SET clue=$2 WHERE id=$1 AND event_id=$3`,
+          [item.roundId, item.clue, eventId],
+        );
+      }
+    });
+
+    await audit(admin.userId, 'UPDATE_CLUES', 'event', eventId, eventId, {
+      count: input.clues.length,
+    });
     response.json({ data: { updated: true } });
   }),
 );
