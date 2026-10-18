@@ -8,14 +8,21 @@ import { authenticate, requireParticipant } from '../../middleware/authenticate.
 import { hashToken } from '../../utils/crypto.js';
 import { HttpError } from '../../utils/http-error.js';
 import { asyncRoute } from '../../utils/route.js';
-import { getGameModule } from '../games/game-registry.js';
+import { gameRegistry, getGameModule } from '../games/game-registry.js';
 import type { Difficulty } from '../games/shared/game.types.js';
+
+type TxClient = Parameters<Parameters<typeof withTransaction>[0]>[0];
 
 const uuid = z.string().uuid();
 const idempotencyKey = z.string().min(8).max(100);
 
 interface AssignmentRow {
   id: string;
+  team_id: string;
+  round_id: string;
+  game_id: string;
+  game_enabled: boolean;
+  round_mapped_game_id: string | null;
   status: string;
   game_code: string;
   game_name: string;
@@ -51,12 +58,103 @@ function assignmentResponse(
 }
 
 const assignmentSelect = `
-  SELECT a.id,a.status,g.code AS game_code,g.name AS game_name,r.difficulty,l.config,
-    a.public_challenge,a.secret_challenge,l.max_attempts,l.cooldown_seconds,
-    r.sequence AS round_sequence,c.label AS checkpoint_label
+  SELECT a.id, a.team_id, a.round_id, a.game_id, g.enabled AS game_enabled, r.game_id AS round_mapped_game_id,
+    a.status, g.code AS game_code, g.name AS game_name, r.difficulty, l.config,
+    a.public_challenge, a.secret_challenge, l.max_attempts, l.cooldown_seconds,
+    r.sequence AS round_sequence, c.label AS checkpoint_label
   FROM game_assignments a JOIN games g ON g.id=a.game_id JOIN game_levels l ON l.id=a.game_level_id
   JOIN rounds r ON r.id=a.round_id JOIN checkpoints c ON c.id=r.checkpoint_id
 `;
+
+async function selectGameForRound(
+  client: TxClient,
+  teamId: string,
+  difficulty: Difficulty,
+  roundMappedGameId: string | null | undefined,
+  excludeRoundId?: string,
+) {
+  let selected: {
+    game_id: string;
+    game_level_id: string;
+    game_code: string;
+    game_name: string;
+    config: Record<string, unknown>;
+    max_attempts: number;
+    cooldown_seconds: number;
+  } | undefined;
+
+  // 1. If round has a specific game mapped, check if team hasn't played it in any OTHER round
+  if (roundMappedGameId) {
+    const mapped = await client.query<{
+      game_id: string;
+      game_level_id: string;
+      game_code: string;
+      game_name: string;
+      config: Record<string, unknown>;
+      max_attempts: number;
+      cooldown_seconds: number;
+    }>(
+      `
+      SELECT g.id game_id, l.id game_level_id, g.code game_code, g.name game_name, l.config, l.max_attempts, l.cooldown_seconds
+      FROM games g JOIN game_levels l ON l.game_id=g.id AND l.difficulty=$2 AND l.enabled
+      WHERE g.id=$3 AND g.enabled
+        AND NOT EXISTS (
+          SELECT 1 FROM game_assignments a
+          WHERE a.team_id=$1 AND a.game_id=g.id ${excludeRoundId ? 'AND a.round_id <> $4' : ''}
+        )
+    `,
+      excludeRoundId
+        ? [teamId, difficulty, roundMappedGameId, excludeRoundId]
+        : [teamId, difficulty, roundMappedGameId],
+    );
+    if (mapped.rows[0]) {
+      selected = mapped.rows[0];
+    }
+  }
+
+  // 2. If no specific mapped game, or team already played that game in another round:
+  // Pick randomly from enabled games that have NOT yet been played by this team in another round
+  if (!selected) {
+    const candidates = await client.query<{
+      game_id: string;
+      game_level_id: string;
+      game_code: string;
+      game_name: string;
+      config: Record<string, unknown>;
+      max_attempts: number;
+      cooldown_seconds: number;
+    }>(
+      `
+      SELECT g.id game_id, l.id game_level_id, g.code game_code, g.name game_name, l.config, l.max_attempts, l.cooldown_seconds
+      FROM games g JOIN game_levels l ON l.game_id=g.id AND l.difficulty=$2 AND l.enabled
+      WHERE g.enabled
+        AND NOT EXISTS (
+          SELECT 1 FROM game_assignments a
+          WHERE a.team_id=$1 AND a.game_id=g.id ${excludeRoundId ? 'AND a.round_id <> $3' : ''}
+        )
+    `,
+      excludeRoundId ? [teamId, difficulty, excludeRoundId] : [teamId, difficulty],
+    );
+    if (!candidates.rowCount || !candidates.rows[0]) {
+      throw new HttpError(409, 'NO_GAMES_AVAILABLE', 'No unused game is available for this team.');
+    }
+    const picked = candidates.rows[randomInt(candidates.rows.length)];
+    if (!picked) {
+      throw new HttpError(409, 'NO_GAMES_AVAILABLE', 'No unused game is available for this team.');
+    }
+    selected = picked;
+  }
+
+  const challenge = getGameModule(selected.game_code).createChallenge(
+    selected.config,
+    difficulty,
+  );
+
+  return {
+    selected,
+    challenge,
+  };
+}
 
 export const huntRouter = Router();
 huntRouter.use(
@@ -192,19 +290,60 @@ huntRouter.post(
         [participant.teamId, currentRound.id],
       );
       if (existing.rows[0]) {
+        const existingRow = existing.rows[0];
+        const isGameUnavailable = !existingRow.game_enabled || !gameRegistry.has(existingRow.game_code);
+        const isMappingMismatched = Boolean(
+          currentRound.game_id && currentRound.game_id !== existingRow.game_id,
+        );
+
+        if (existingRow.status !== 'PASSED' && (isGameUnavailable || isMappingMismatched)) {
+          const { selected, challenge } = await selectGameForRound(
+            client,
+            participant.teamId,
+            currentRound.difficulty,
+            currentRound.game_id,
+            currentRound.id,
+          );
+
+          await client.query(
+            `UPDATE game_attempts SET status='cancelled', ended_at=now() WHERE assignment_id=$1 AND status='in_progress'`,
+            [existingRow.id],
+          );
+
+          await client.query(
+            `UPDATE game_assignments
+             SET game_id=$2, game_level_id=$3, public_challenge=$4, secret_challenge=$5, status='ASSIGNED', assigned_at=now()
+             WHERE id=$1`,
+            [
+              existingRow.id,
+              selected.game_id,
+              selected.game_level_id,
+              challenge.publicData,
+              challenge.secretData,
+            ],
+          );
+
+          const updated = await client.query<AssignmentRow>(
+            `${assignmentSelect} WHERE a.id=$1`,
+            [existingRow.id],
+          );
+          if (!updated.rows[0]) throw new HttpError(404, 'NOT_FOUND', 'Assignment not found.');
+          return assignmentResponse(updated.rows[0], 0, null);
+        }
+
         const active = await client.query<{ id: string; started_at: string }>(
           `SELECT id, started_at FROM game_attempts
            WHERE assignment_id=$1 AND status='in_progress' AND started_at >= now() - interval '5 minutes'
            ORDER BY started_at DESC LIMIT 1`,
-          [existing.rows[0].id],
+          [existingRow.id],
         );
         return assignmentResponse(
-          existing.rows[0],
+          existingRow,
           Number(
             (
               await client.query(
                 `SELECT count(*)::int count FROM game_attempts WHERE assignment_id=$1`,
-                [existing.rows[0].id],
+                [existingRow.id],
               )
             ).rows[0]?.count ?? 0,
           ),
@@ -212,67 +351,13 @@ huntRouter.post(
         );
       }
 
-      let selected: {
-        game_id: string;
-        game_level_id: string;
-        game_code: string;
-        game_name: string;
-        config: Record<string, unknown>;
-        max_attempts: number;
-        cooldown_seconds: number;
-      } | undefined;
-
-      // If this round is mapped to a specific game, check if this team hasn't played it yet
-      if (currentRound.game_id) {
-        const mapped = await client.query<{
-          game_id: string;
-          game_level_id: string;
-          game_code: string;
-          game_name: string;
-          config: Record<string, unknown>;
-          max_attempts: number;
-          cooldown_seconds: number;
-        }>(
-          `
-        SELECT g.id game_id,l.id game_level_id,g.code game_code,g.name game_name,l.config,l.max_attempts,l.cooldown_seconds
-        FROM games g JOIN game_levels l ON l.game_id=g.id AND l.difficulty=$2 AND l.enabled
-        WHERE g.id=$3 AND g.enabled AND NOT EXISTS (SELECT 1 FROM game_assignments a WHERE a.team_id=$1 AND a.game_id=g.id)
-      `,
-          [participant.teamId, currentRound.difficulty, currentRound.game_id],
-        );
-        if (mapped.rows[0]) {
-          selected = mapped.rows[0];
-        }
-      }
-
-      // If no specific game mapped or the mapped game was already played by this team:
-      // Pick randomly from enabled games that have NOT yet been played by this team
-      if (!selected) {
-        const candidates = await client.query<{
-          game_id: string;
-          game_level_id: string;
-          game_code: string;
-          game_name: string;
-          config: Record<string, unknown>;
-          max_attempts: number;
-          cooldown_seconds: number;
-        }>(
-          `
-        SELECT g.id game_id,l.id game_level_id,g.code game_code,g.name game_name,l.config,l.max_attempts,l.cooldown_seconds
-        FROM games g JOIN game_levels l ON l.game_id=g.id AND l.difficulty=$2 AND l.enabled
-        WHERE g.enabled AND NOT EXISTS (SELECT 1 FROM game_assignments a WHERE a.team_id=$1 AND a.game_id=g.id)
-      `,
-          [participant.teamId, currentRound.difficulty],
-        );
-        if (!candidates.rowCount)
-          throw new HttpError(409, 'NO_GAMES_AVAILABLE', 'No unused game is available for this team.');
-        selected = candidates.rows[randomInt(candidates.rows.length)]!;
-      }
-
-      const challenge = getGameModule(selected.game_code).createChallenge(
-        selected.config,
+      const { selected, challenge } = await selectGameForRound(
+        client,
+        participant.teamId,
         currentRound.difficulty,
+        currentRound.game_id,
       );
+
       const inserted = await client.query<{ id: string; status: string }>(
         `INSERT INTO game_assignments(team_id,round_id,game_id,game_level_id,public_challenge,secret_challenge) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,status`,
         [
@@ -288,6 +373,10 @@ huntRouter.post(
         {
           ...selected,
           ...inserted.rows[0]!,
+          game_enabled: true,
+          round_mapped_game_id: currentRound.game_id,
+          team_id: participant.teamId,
+          round_id: currentRound.id,
           difficulty: currentRound.difficulty,
           public_challenge: challenge.publicData,
           secret_challenge: challenge.secretData,
@@ -306,7 +395,7 @@ huntRouter.get(
   asyncRoute(async (request, response) => {
     const participant = requireParticipant(request);
     const assignmentId = uuid.parse(request.params.assignmentId);
-    const result = await query<AssignmentRow>(
+    let result = await query<AssignmentRow>(
       `${assignmentSelect}
        JOIN team_progress tp ON tp.team_id=a.team_id
        WHERE a.id=$1 AND a.team_id=$2 AND a.status='ASSIGNED'
@@ -319,6 +408,48 @@ huntRouter.get(
         'CURRENT_GAME_NOT_FOUND',
         'Scan the QR at your current checkpoint to unlock the game.',
       );
+
+    let row = result.rows[0];
+    const isGameUnavailable = !row.game_enabled || !gameRegistry.has(row.game_code);
+    if (row.status !== 'PASSED' && isGameUnavailable) {
+      await withTransaction(async (client) => {
+        const roundResult = await client.query<{ id: string; difficulty: Difficulty; game_id: string | null }>(
+          `SELECT id, difficulty, game_id FROM rounds WHERE id=$1`,
+          [row.round_id],
+        );
+        if (roundResult.rows[0]) {
+          const { selected, challenge } = await selectGameForRound(
+            client,
+            participant.teamId,
+            roundResult.rows[0].difficulty,
+            roundResult.rows[0].game_id,
+            row.round_id,
+          );
+          await client.query(
+            `UPDATE game_attempts SET status='cancelled', ended_at=now() WHERE assignment_id=$1 AND status='in_progress'`,
+            [assignmentId],
+          );
+          await client.query(
+            `UPDATE game_assignments
+             SET game_id=$2, game_level_id=$3, public_challenge=$4, secret_challenge=$5, status='ASSIGNED', assigned_at=now()
+             WHERE id=$1`,
+            [
+              assignmentId,
+              selected.game_id,
+              selected.game_level_id,
+              challenge.publicData,
+              challenge.secretData,
+            ],
+          );
+        }
+      });
+      result = await query<AssignmentRow>(
+        `${assignmentSelect} WHERE a.id=$1`,
+        [assignmentId],
+      );
+      row = result.rows[0]!;
+    }
+
     const attempts = await query<{ count: number }>(
       `SELECT count(*)::int count FROM game_attempts WHERE assignment_id=$1`,
       [assignmentId],
@@ -331,10 +462,78 @@ huntRouter.get(
     );
     response.json({
       data: assignmentResponse(
-        result.rows[0],
+        row,
         attempts.rows[0]?.count ?? 0,
         active.rows[0] ?? null,
       ),
+    });
+  }),
+);
+
+huntRouter.post(
+  '/assignments/:assignmentId/reload',
+  asyncRoute(async (request, response) => {
+    const participant = requireParticipant(request);
+    const assignmentId = uuid.parse(request.params.assignmentId);
+
+    const updated = await withTransaction(async (client) => {
+      const assignment = await client.query<AssignmentRow>(
+        `${assignmentSelect}
+         JOIN team_progress tp ON tp.team_id=a.team_id
+         WHERE a.id=$1 AND a.team_id=$2 AND a.status='ASSIGNED'
+           AND tp.status='IN_PROGRESS' AND r.sequence=tp.current_sequence`,
+        [assignmentId, participant.teamId],
+      );
+      if (!assignment.rows[0]) {
+        throw new HttpError(404, 'ASSIGNMENT_NOT_FOUND', 'Active assignment not found for current round.');
+      }
+      const row = assignment.rows[0];
+
+      const roundResult = await client.query<{ id: string; difficulty: Difficulty; game_id: string | null }>(
+        `SELECT id, difficulty, game_id FROM rounds WHERE id=$1`,
+        [row.round_id],
+      );
+      if (!roundResult.rows[0]) {
+        throw new HttpError(404, 'ROUND_NOT_FOUND', 'Round not found.');
+      }
+
+      const { selected, challenge } = await selectGameForRound(
+        client,
+        participant.teamId,
+        roundResult.rows[0].difficulty,
+        roundResult.rows[0].game_id,
+        row.round_id,
+      );
+
+      // Cancel any in-progress attempt on old game
+      await client.query(
+        `UPDATE game_attempts SET status='cancelled', ended_at=now() WHERE assignment_id=$1 AND status='in_progress'`,
+        [assignmentId],
+      );
+
+      // Update assignment with new game
+      await client.query(
+        `UPDATE game_assignments
+         SET game_id=$2, game_level_id=$3, public_challenge=$4, secret_challenge=$5, status='ASSIGNED', assigned_at=now()
+         WHERE id=$1`,
+        [
+          assignmentId,
+          selected.game_id,
+          selected.game_level_id,
+          challenge.publicData,
+          challenge.secretData,
+        ],
+      );
+
+      const refreshed = await client.query<AssignmentRow>(
+        `${assignmentSelect} WHERE a.id=$1`,
+        [assignmentId],
+      );
+      return refreshed.rows[0]!;
+    });
+
+    response.json({
+      data: assignmentResponse(updated, 0, null),
     });
   }),
 );

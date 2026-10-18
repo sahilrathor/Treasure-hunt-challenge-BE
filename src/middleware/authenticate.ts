@@ -87,12 +87,14 @@ export function requireRole(...roles: AuthIdentity['role'][]): RequestHandler {
   };
 }
 
-export function requireParticipant(request: Request) {
+export function requireParticipant(
+  request: Request,
+): AuthIdentity & { teamId: string; eventId: string } {
   const identity = request.auth;
   if (!identity || identity.role !== 'PARTICIPANT' || !identity.teamId || !identity.eventId) {
     throw new HttpError(403, 'PARTICIPANT_REQUIRED', 'A participant account is required.');
   }
-  return identity;
+  return identity as AuthIdentity & { teamId: string; eventId: string };
 }
 
 export function requireAdmin(request: Request) {
