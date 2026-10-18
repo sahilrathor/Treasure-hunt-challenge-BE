@@ -42,6 +42,7 @@ const roundSchema = z.object({
   sequence: z.number().int().min(1).max(8),
   clue: z.string().trim().min(2).max(1000),
   difficulty: z.enum(['easy', 'medium', 'hard']),
+  gameId: uuid.nullable().optional(),
 });
 
 async function audit(
@@ -92,8 +93,11 @@ adminRouter.get(
         [current.id],
       ),
       query(
-        `SELECT c.id,c.label,r.sequence FROM checkpoints c
+        `SELECT c.id, c.label, r.id AS round_id, r.sequence, r.difficulty, r.clue,
+                r.game_id, g.name AS game_name, g.code AS game_code
+         FROM checkpoints c
          JOIN rounds r ON r.checkpoint_id=c.id
+         LEFT JOIN games g ON g.id=r.game_id
          WHERE c.event_id=$1 AND c.active ORDER BY r.sequence`,
         [current.id],
       ),
@@ -734,15 +738,99 @@ adminRouter.patch(
   asyncRoute(async (request, response) => {
     const admin = requireAdmin(request);
     const roundId = uuid.parse(request.params.roundId);
-    const input = roundSchema.pick({ clue: true, difficulty: true }).partial().parse(request.body);
-    const result = await query<{ event_id: string }>(
-      `UPDATE rounds r SET clue=COALESCE($2,clue),difficulty=COALESCE($3,difficulty) FROM events e WHERE r.id=$1 AND e.id=r.event_id AND e.status='DRAFT' RETURNING r.event_id`,
-      [roundId, input.clue ?? null, input.difficulty ?? null],
+    const input = z
+      .object({
+        clue: z.string().trim().min(2).max(1000).optional(),
+        difficulty: z.enum(['easy', 'medium', 'hard']).optional(),
+        gameId: uuid.nullable().optional(),
+      })
+      .parse(request.body);
+
+    const hasGameId = Object.prototype.hasOwnProperty.call(input, 'gameId');
+
+    const result = await query<{ event_id: string; sequence: number }>(
+      `UPDATE rounds r
+       SET clue=COALESCE($2, clue),
+           difficulty=COALESCE($3, difficulty),
+           game_id=CASE WHEN $4::boolean THEN $5::uuid ELSE r.game_id END
+       FROM events e
+       WHERE r.id=$1 AND e.id=r.event_id AND e.status<>'FINISHED'
+       RETURNING r.event_id, r.sequence`,
+      [roundId, input.clue ?? null, input.difficulty ?? null, hasGameId, input.gameId ?? null],
     );
     if (!result.rows[0])
-      throw new HttpError(409, 'ROUND_NOT_EDITABLE', 'Only rounds in draft events can be edited.');
+      throw new HttpError(404, 'ROUND_NOT_FOUND', 'Round not found or event is finished.');
     await audit(admin.userId, 'UPDATE', 'round', roundId, result.rows[0].event_id, input);
-    response.json({ data: { id: roundId } });
+    response.json({ data: { id: roundId, ...input } });
+  }),
+);
+
+adminRouter.post(
+  '/admin/events/:eventId/round-games',
+  asyncRoute(async (request, response) => {
+    const admin = requireAdmin(request);
+    const eventId = uuid.parse(request.params.eventId);
+    const input = z
+      .object({
+        setAllRandom: z.boolean().optional(),
+        mappings: z
+          .array(
+            z.object({
+              roundId: uuid,
+              gameId: uuid.nullable(),
+            }),
+          )
+          .optional(),
+      })
+      .parse(request.body);
+
+    await withTransaction(async (client) => {
+      const event = await client.query<{ id: string; status: string }>(
+        `SELECT id, status FROM events WHERE id=$1`,
+        [eventId],
+      );
+      if (!event.rows[0]) throw new HttpError(404, 'EVENT_NOT_FOUND', 'Event not found.');
+      if (event.rows[0].status === 'FINISHED')
+        throw new HttpError(409, 'EVENT_FINISHED', 'Cannot modify rounds for a finished event.');
+
+      if (input.setAllRandom) {
+        await client.query(`UPDATE rounds SET game_id=NULL WHERE event_id=$1`, [eventId]);
+      } else if (input.mappings) {
+        for (const mapping of input.mappings) {
+          await client.query(
+            `UPDATE rounds SET game_id=$2 WHERE id=$1 AND event_id=$3`,
+            [mapping.roundId, mapping.gameId, eventId],
+          );
+        }
+      }
+    });
+
+    await audit(admin.userId, 'MAP_ROUND_GAMES', 'event', eventId, eventId, input);
+    response.json({ data: { updated: true } });
+  }),
+);
+
+adminRouter.get(
+  '/admin/games',
+  asyncRoute(async (request, response) => {
+    requireAdmin(request);
+    const result = await query(
+      `SELECT g.id, g.code, g.name, g.enabled,
+         COALESCE(jsonb_agg(jsonb_build_object(
+           'id', l.id,
+           'difficulty', l.difficulty,
+           'config', l.config,
+           'maxAttempts', l.max_attempts,
+           'cooldownSeconds', l.cooldown_seconds
+         ) ORDER BY CASE l.difficulty WHEN 'easy' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END)
+         FILTER (WHERE l.id IS NOT NULL), '[]'::jsonb) AS levels
+       FROM games g
+       LEFT JOIN game_levels l ON l.game_id = g.id AND l.enabled
+       WHERE g.enabled
+       GROUP BY g.id, g.code, g.name, g.enabled
+       ORDER BY g.name`,
+    );
+    response.json({ data: result.rows });
   }),
 );
 

@@ -29,7 +29,11 @@ interface AssignmentRow {
   checkpoint_label: string;
 }
 
-function assignmentResponse(row: AssignmentRow, attempts = 0) {
+function assignmentResponse(
+  row: AssignmentRow,
+  attempts = 0,
+  activeAttempt?: { id: string; started_at: string } | null,
+) {
   return {
     id: row.id,
     status: row.status,
@@ -42,6 +46,7 @@ function assignmentResponse(row: AssignmentRow, attempts = 0) {
     cooldownSeconds: row.cooldown_seconds,
     round: row.round_sequence,
     checkpointLabel: row.checkpoint_label,
+    activeAttempt: activeAttempt ?? null,
   };
 }
 
@@ -165,9 +170,10 @@ huntRouter.post(
         sequence: number;
         difficulty: Difficulty;
         checkpoint_label: string;
+        game_id: string | null;
       }>(
         `
-      SELECT r.id,r.sequence,r.difficulty,c.label checkpoint_label FROM checkpoints c JOIN rounds r ON r.checkpoint_id=c.id
+      SELECT r.id,r.sequence,r.difficulty,c.label checkpoint_label,r.game_id FROM checkpoints c JOIN rounds r ON r.checkpoint_id=c.id
       WHERE c.event_id=$1 AND c.qr_token_hash=$2 AND c.active
     `,
         [participant.eventId, hashToken(token)],
@@ -185,7 +191,13 @@ huntRouter.post(
         `${assignmentSelect} WHERE a.team_id=$1 AND a.round_id=$2`,
         [participant.teamId, currentRound.id],
       );
-      if (existing.rows[0])
+      if (existing.rows[0]) {
+        const active = await client.query<{ id: string; started_at: string }>(
+          `SELECT id, started_at FROM game_attempts
+           WHERE assignment_id=$1 AND status='in_progress' AND started_at >= now() - interval '5 minutes'
+           ORDER BY started_at DESC LIMIT 1`,
+          [existing.rows[0].id],
+        );
         return assignmentResponse(
           existing.rows[0],
           Number(
@@ -196,8 +208,11 @@ huntRouter.post(
               )
             ).rows[0]?.count ?? 0,
           ),
+          active.rows[0] ?? null,
         );
-      const candidates = await client.query<{
+      }
+
+      let selected: {
         game_id: string;
         game_level_id: string;
         game_code: string;
@@ -205,17 +220,55 @@ huntRouter.post(
         config: Record<string, unknown>;
         max_attempts: number;
         cooldown_seconds: number;
-      }>(
-        `
-      SELECT g.id game_id,l.id game_level_id,g.code game_code,g.name game_name,l.config,l.max_attempts,l.cooldown_seconds
-      FROM games g JOIN game_levels l ON l.game_id=g.id AND l.difficulty=$2 AND l.enabled
-      WHERE g.enabled AND NOT EXISTS (SELECT 1 FROM game_assignments a WHERE a.team_id=$1 AND a.game_id=g.id)
-    `,
-        [participant.teamId, currentRound.difficulty],
-      );
-      if (!candidates.rowCount)
-        throw new HttpError(409, 'NO_GAMES_AVAILABLE', 'No unused game is available.');
-      const selected = candidates.rows[randomInt(candidates.rows.length)]!;
+      } | undefined;
+
+      // If this round is mapped to a specific game, check if this team hasn't played it yet
+      if (currentRound.game_id) {
+        const mapped = await client.query<{
+          game_id: string;
+          game_level_id: string;
+          game_code: string;
+          game_name: string;
+          config: Record<string, unknown>;
+          max_attempts: number;
+          cooldown_seconds: number;
+        }>(
+          `
+        SELECT g.id game_id,l.id game_level_id,g.code game_code,g.name game_name,l.config,l.max_attempts,l.cooldown_seconds
+        FROM games g JOIN game_levels l ON l.game_id=g.id AND l.difficulty=$2 AND l.enabled
+        WHERE g.id=$3 AND g.enabled AND NOT EXISTS (SELECT 1 FROM game_assignments a WHERE a.team_id=$1 AND a.game_id=g.id)
+      `,
+          [participant.teamId, currentRound.difficulty, currentRound.game_id],
+        );
+        if (mapped.rows[0]) {
+          selected = mapped.rows[0];
+        }
+      }
+
+      // If no specific game mapped or the mapped game was already played by this team:
+      // Pick randomly from enabled games that have NOT yet been played by this team
+      if (!selected) {
+        const candidates = await client.query<{
+          game_id: string;
+          game_level_id: string;
+          game_code: string;
+          game_name: string;
+          config: Record<string, unknown>;
+          max_attempts: number;
+          cooldown_seconds: number;
+        }>(
+          `
+        SELECT g.id game_id,l.id game_level_id,g.code game_code,g.name game_name,l.config,l.max_attempts,l.cooldown_seconds
+        FROM games g JOIN game_levels l ON l.game_id=g.id AND l.difficulty=$2 AND l.enabled
+        WHERE g.enabled AND NOT EXISTS (SELECT 1 FROM game_assignments a WHERE a.team_id=$1 AND a.game_id=g.id)
+      `,
+          [participant.teamId, currentRound.difficulty],
+        );
+        if (!candidates.rowCount)
+          throw new HttpError(409, 'NO_GAMES_AVAILABLE', 'No unused game is available for this team.');
+        selected = candidates.rows[randomInt(candidates.rows.length)]!;
+      }
+
       const challenge = getGameModule(selected.game_code).createChallenge(
         selected.config,
         currentRound.difficulty,
@@ -270,7 +323,19 @@ huntRouter.get(
       `SELECT count(*)::int count FROM game_attempts WHERE assignment_id=$1`,
       [assignmentId],
     );
-    response.json({ data: assignmentResponse(result.rows[0], attempts.rows[0]?.count ?? 0) });
+    const active = await query<{ id: string; started_at: string }>(
+      `SELECT id, started_at FROM game_attempts
+       WHERE assignment_id=$1 AND status='in_progress' AND started_at >= now() - interval '5 minutes'
+       ORDER BY started_at DESC LIMIT 1`,
+      [assignmentId],
+    );
+    response.json({
+      data: assignmentResponse(
+        result.rows[0],
+        attempts.rows[0]?.count ?? 0,
+        active.rows[0] ?? null,
+      ),
+    });
   }),
 );
 
