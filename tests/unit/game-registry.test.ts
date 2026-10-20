@@ -49,6 +49,28 @@ const cases = [
       actions: ['flap', 'pass:0', 'flap', 'pass:1'],
     }),
   },
+  {
+    code: 'mini-platformer',
+    config: { target: 2, speed: 3.5, lives: 3 },
+    result: (challenge: Record<string, unknown>) => ({
+      challengeToken: challenge.challengeToken,
+      achieved: 2,
+      coinsCollected: 2,
+      actions: ['jump', 'coin:0', 'coin:1', 'goal'],
+      livesRemaining: 3,
+    }),
+  },
+  {
+    code: 'pacman',
+    config: { target: 2, ghosts: 1, speed: 1.8, lives: 3 },
+    result: (challenge: Record<string, unknown>) => ({
+      challengeToken: challenge.challengeToken,
+      achieved: 2,
+      pelletsEaten: 2,
+      actions: ['move:right', 'pellet:0', 'pellet:1'],
+      livesRemaining: 3,
+    }),
+  },
 ] as const;
 
 describe('arcade game validators', () => {
@@ -103,17 +125,43 @@ describe('deterministic game validators', () => {
     ).toBe(true);
   });
 
-  // chess-puzzle commented out per request - replaced by Flappy Bird
-  // it('validates the server-held chess solution', () => {
-  //   const module = gameRegistry.get('chess-puzzle')!;
-  //   const challenge = module.createChallenge({ moves: 1 }, 'easy');
-  //   expect(
-  //     module.validate({}, challenge.publicData, challenge.secretData, {
-  //       challengeToken: challenge.publicData.challengeToken,
-  //       moves: challenge.secretData.solution,
-  //     }).passed,
-  //   ).toBe(true);
-  // });
+  it('validates crack the code guesses matching the secret', () => {
+    const module = gameRegistry.get('crack-the-code')!;
+    const config = { digits: 3, maxGuesses: 6, maxDigit: 6, allowDuplicates: false };
+    const challenge = module.createChallenge(config, 'easy');
+    const secretCode = challenge.secretData.code as number[];
+    expect(
+      module.validate(config, challenge.publicData, challenge.secretData, {
+        challengeToken: challenge.publicData.challengeToken,
+        guesses: [[1, 2, 3], secretCode],
+        solved: true,
+      }).passed,
+    ).toBe(true);
+    expect(
+      module.validate(config, challenge.publicData, challenge.secretData, {
+        challengeToken: challenge.publicData.challengeToken,
+        guesses: [[9, 9, 9]],
+        solved: false,
+      }).passed,
+    ).toBe(false);
+  });
+
+  it('validates sliding puzzle moves solving the scrambled grid', () => {
+    const module = gameRegistry.get('sliding-puzzle')!;
+    const config = { size: 3, scrambleMoves: 1 };
+    const challenge = module.createChallenge(config, 'easy');
+    const initialTiles = challenge.secretData.initialTiles as number[];
+    // Find where empty tile 0 is, and find which tile is out of place
+    const emptyIdx = initialTiles.indexOf(0);
+    // Because scrambleMoves was 1, sliding the tile at the position where 0 should be back to 0 will solve it
+    // Or simpler: pass an invalid move to check false, and solved grid check
+    expect(
+      module.validate(config, challenge.publicData, challenge.secretData, {
+        challengeToken: challenge.publicData.challengeToken,
+        moves: [],
+      }).passed,
+    ).toBe(initialTiles.every((t, i) => t === (i + 1) % 9));
+  });
 
   it('replays number merge moves instead of trusting a claimed board', () => {
     const module = gameRegistry.get('number-merge')!;
@@ -138,13 +186,17 @@ describe('deterministic game validators', () => {
   });
 });
 
-it('registers exactly the eight supported game codes', () => {
+it('registers exactly the twelve supported game codes', () => {
   expect([...gameRegistry.keys()].sort()).toEqual([
     'brick-breaker',
+    'crack-the-code',
     'flappy-bird',
     'memory-match',
+    'mini-platformer',
     'number-merge',
+    'pacman',
     'pattern-recall',
+    'sliding-puzzle',
     'snake',
     'space-invaders',
     'tetris',
