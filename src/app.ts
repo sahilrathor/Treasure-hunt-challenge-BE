@@ -16,18 +16,39 @@ import { HttpError } from './utils/http-error.js';
 export interface AppOptions {
   allowedOrigin?: string;
   logLevel?: Parameters<typeof createLogger>[0];
+  environment?: 'development' | 'test' | 'production';
 }
 
 export function createApp(options: AppOptions = {}) {
   const app = express();
   const logger = createLogger(options.logLevel ?? 'info');
+  const isDev = (options.environment ?? process.env.NODE_ENV) !== 'production';
+
+  const isOriginAllowed = (origin?: string) => {
+    if (!origin) return true;
+    if (isDev) return true;
+    if (!options.allowedOrigin) return true;
+    const cleanOrigin = origin.replace(/\/+$/, '').toLowerCase();
+    const cleanAllowed = options.allowedOrigin.replace(/\/+$/, '').toLowerCase();
+    return cleanOrigin === cleanAllowed;
+  };
 
   app.disable('x-powered-by');
   app.use(pinoHttp({ logger }));
-  app.use(helmet());
+  app.use(
+    helmet({
+      crossOriginResourcePolicy: { policy: 'cross-origin' },
+    }),
+  );
   app.use(
     cors({
-      origin: options.allowedOrigin ?? false,
+      origin: (requestOrigin, callback) => {
+        if (isOriginAllowed(requestOrigin)) {
+          callback(null, true);
+        } else {
+          callback(null, false);
+        }
+      },
       credentials: true,
     }),
   );
@@ -46,7 +67,7 @@ export function createApp(options: AppOptions = {}) {
   );
   app.use((request, _response, next) => {
     const origin = request.headers.origin;
-    if (origin && options.allowedOrigin && origin !== options.allowedOrigin) {
+    if (origin && options.allowedOrigin && !isOriginAllowed(origin)) {
       next(new HttpError(403, 'ORIGIN_FORBIDDEN', 'The request origin is not allowed.'));
       return;
     }

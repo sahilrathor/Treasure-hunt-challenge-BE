@@ -645,6 +645,43 @@ adminRouter.patch(
   }),
 );
 
+adminRouter.patch(
+  '/admin/account/credentials',
+  asyncRoute(async (request, response) => {
+    const admin = requireAdmin(request);
+    const input = z
+      .object({
+        username: z
+          .string()
+          .trim()
+          .min(3)
+          .max(64)
+          .regex(/^[A-Za-z0-9@._-]+$/),
+        password: z.string().min(6).max(200),
+      })
+      .parse(request.body);
+
+    const duplicate = await query<{ id: string }>(
+      `SELECT id FROM admin_users WHERE email=$1 AND id<>$2 LIMIT 1`,
+      [input.username, admin.userId],
+    );
+    if (duplicate.rows[0]) {
+      throw new HttpError(409, 'USERNAME_TAKEN', 'That admin username is already in use.');
+    }
+
+    const passwordHash = await argon2.hash(input.password, { type: argon2.argon2id });
+    await query(`UPDATE admin_users SET email=$1,password_hash=$2 WHERE id=$3`, [
+      input.username,
+      passwordHash,
+      admin.userId,
+    ]);
+    await audit(admin.userId, 'CHANGE_CREDENTIALS', 'admin_user', admin.userId, null, {
+      username: input.username,
+    });
+    response.json({ data: { updated: true, username: input.username } });
+  }),
+);
+
 adminRouter.post(
   '/admin/checkpoints',
   asyncRoute(async (request, response) => {
@@ -679,6 +716,7 @@ adminRouter.patch(
         active: z.boolean().optional(),
         rotateToken: z.boolean().optional(),
         clue: z.string().trim().min(1).max(1000).optional(),
+        difficulty: z.enum(['easy', 'medium', 'hard']).optional(),
       })
       .parse(request.body);
     const token = input.rotateToken ? createToken(24) : null;
@@ -700,6 +738,13 @@ adminRouter.patch(
       await query(
         `UPDATE rounds SET clue=$2 WHERE checkpoint_id=$1 AND event_id=$3`,
         [checkpointId, input.clue, result.rows[0].event_id],
+      );
+    }
+
+    if (input.difficulty !== undefined) {
+      await query(
+        `UPDATE rounds SET difficulty=$2 WHERE checkpoint_id=$1 AND event_id=$3`,
+        [checkpointId, input.difficulty, result.rows[0].event_id],
       );
     }
 
@@ -787,7 +832,8 @@ adminRouter.post(
           .array(
             z.object({
               roundId: uuid,
-              gameId: uuid.nullable(),
+              gameId: uuid.nullable().optional(),
+              difficulty: z.enum(['easy', 'medium', 'hard']).optional(),
             }),
           )
           .optional(),
@@ -807,15 +853,67 @@ adminRouter.post(
         await client.query(`UPDATE rounds SET game_id=NULL WHERE event_id=$1`, [eventId]);
       } else if (input.mappings) {
         for (const mapping of input.mappings) {
-          await client.query(
-            `UPDATE rounds SET game_id=$2 WHERE id=$1 AND event_id=$3`,
-            [mapping.roundId, mapping.gameId, eventId],
-          );
+          if (mapping.difficulty !== undefined && mapping.gameId !== undefined) {
+            await client.query(
+              `UPDATE rounds SET game_id=$2, difficulty=$3 WHERE id=$1 AND event_id=$4`,
+              [mapping.roundId, mapping.gameId, mapping.difficulty, eventId],
+            );
+          } else if (mapping.difficulty !== undefined) {
+            await client.query(
+              `UPDATE rounds SET difficulty=$2 WHERE id=$1 AND event_id=$3`,
+              [mapping.roundId, mapping.difficulty, eventId],
+            );
+          } else if (mapping.gameId !== undefined) {
+            await client.query(
+              `UPDATE rounds SET game_id=$2 WHERE id=$1 AND event_id=$3`,
+              [mapping.roundId, mapping.gameId, eventId],
+            );
+          }
         }
       }
     });
 
     await audit(admin.userId, 'MAP_ROUND_GAMES', 'event', eventId, eventId, input);
+    response.json({ data: { updated: true } });
+  }),
+);
+
+adminRouter.post(
+  '/admin/events/:eventId/round-difficulties',
+  asyncRoute(async (request, response) => {
+    const admin = requireAdmin(request);
+    const eventId = uuid.parse(request.params.eventId);
+    const input = z
+      .object({
+        difficulties: z.array(
+          z.object({
+            roundId: uuid,
+            difficulty: z.enum(['easy', 'medium', 'hard']),
+          }),
+        ),
+      })
+      .parse(request.body);
+
+    await withTransaction(async (client) => {
+      const event = await client.query<{ id: string; status: string }>(
+        `SELECT id, status FROM events WHERE id=$1`,
+        [eventId],
+      );
+      if (!event.rows[0]) throw new HttpError(404, 'EVENT_NOT_FOUND', 'Event not found.');
+      if (event.rows[0].status === 'FINISHED')
+        throw new HttpError(409, 'EVENT_FINISHED', 'Cannot modify difficulties for a finished event.');
+
+      for (const item of input.difficulties) {
+        await client.query(
+          `UPDATE rounds SET difficulty=$2 WHERE id=$1 AND event_id=$3`,
+          [item.roundId, item.difficulty, eventId],
+        );
+      }
+    });
+
+    await audit(admin.userId, 'UPDATE_ROUND_DIFFICULTIES', 'event', eventId, eventId, {
+      count: input.difficulties.length,
+    });
     response.json({ data: { updated: true } });
   }),
 );

@@ -14,6 +14,7 @@ try {
 const app = createApp({
   allowedOrigin: env.FRONTEND_ORIGIN,
   logLevel: env.LOG_LEVEL,
+  environment: env.NODE_ENV,
 });
 
 const server = app.listen(env.PORT, () => {

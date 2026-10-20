@@ -9,6 +9,7 @@ export interface AuthIdentity {
   userId: string;
   role: 'PARTICIPANT' | 'ADMIN' | 'SUPER_ADMIN';
   displayName: string;
+  username: string | null;
   eventId: string | null;
   teamId: string | null;
   memberCode: string | null;
@@ -41,6 +42,7 @@ export const authenticate: RequestHandler = async (request, _response, next) => 
       user_id: string;
       role: AuthIdentity['role'];
       display_name: string;
+      username: string | null;
       event_id: string | null;
       team_id: string | null;
       member_code: string | null;
@@ -50,6 +52,7 @@ export const authenticate: RequestHandler = async (request, _response, next) => 
         COALESCE(p.id, a.id) AS user_id,
         CASE WHEN p.id IS NOT NULL THEN 'PARTICIPANT' ELSE a.role END AS role,
         COALESCE(p.display_name, a.display_name) AS display_name,
+        a.email AS username,
         p.event_id, p.team_id, p.member_code
       FROM sessions s
       LEFT JOIN participants p ON p.id = s.participant_id AND p.active
@@ -67,6 +70,7 @@ export const authenticate: RequestHandler = async (request, _response, next) => 
       userId: identity.user_id,
       role: identity.role,
       displayName: identity.display_name,
+      username: identity.username,
       eventId: identity.event_id,
       teamId: identity.team_id,
       memberCode: identity.member_code,
