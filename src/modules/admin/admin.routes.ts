@@ -1116,7 +1116,7 @@ adminRouter.get(
   asyncRoute(async (request, response) => {
     requireAdmin(request);
     const result = await query(
-      `SELECT g.id, g.code, g.name, g.enabled,
+      `SELECT g.id, g.code, g.name, COALESCE(g.description, '') AS description, g.enabled,
          COALESCE(jsonb_agg(jsonb_build_object(
            'id', l.id,
            'difficulty', l.difficulty,
@@ -1128,7 +1128,7 @@ adminRouter.get(
        FROM games g
        LEFT JOIN game_levels l ON l.game_id = g.id AND l.enabled
        WHERE g.enabled
-       GROUP BY g.id, g.code, g.name, g.enabled
+       GROUP BY g.id, g.code, g.name, g.description, g.enabled
        ORDER BY g.name`,
     );
     response.json({ data: result.rows });

@@ -26,6 +26,7 @@ interface AssignmentRow {
   status: string;
   game_code: string;
   game_name: string;
+  game_description?: string;
   difficulty: Difficulty;
   config: Record<string, unknown>;
   public_challenge: Record<string, unknown>;
@@ -46,6 +47,7 @@ function assignmentResponse(
     status: row.status,
     gameCode: row.game_code,
     gameName: row.game_name,
+    gameDescription: row.game_description ?? '',
     difficulty: row.difficulty,
     challenge: row.public_challenge,
     maxAttempts: row.max_attempts,
@@ -59,7 +61,7 @@ function assignmentResponse(
 
 const assignmentSelect = `
   SELECT a.id, a.team_id, a.round_id, a.game_id, g.enabled AS game_enabled, r.game_id AS round_mapped_game_id,
-    a.status, g.code AS game_code, g.name AS game_name, r.difficulty, l.config,
+    a.status, g.code AS game_code, g.name AS game_name, COALESCE(g.description, '') AS game_description, r.difficulty, l.config,
     a.public_challenge, a.secret_challenge, l.max_attempts, l.cooldown_seconds,
     r.sequence AS round_sequence, c.label AS checkpoint_label
   FROM game_assignments a JOIN games g ON g.id=a.game_id JOIN game_levels l ON l.id=a.game_level_id
