@@ -193,7 +193,7 @@ huntRouter.get(
     const result = await query(
       `SELECT tp.status,tp.current_sequence,tp.started_at,tp.completed_at,
     a.id AS assignment_id,a.status AS assignment_status,g.code AS game_code,g.name AS game_name,r.difficulty,
-    (SELECT count(*)::int FROM game_attempts x WHERE x.assignment_id=a.id) AS attempt_count,
+    (SELECT count(*)::int FROM game_attempts x WHERE x.assignment_id=a.id AND x.status<>'cancelled') AS attempt_count,
     l.max_attempts,l.cooldown_seconds,
     (SELECT max(ended_at) FROM game_attempts x WHERE x.assignment_id=a.id AND x.status IN ('failed','expired')) AS last_failed_at
     FROM team_progress tp LEFT JOIN rounds r ON r.event_id=$2 AND r.sequence=tp.current_sequence
@@ -342,7 +342,7 @@ huntRouter.post(
           Number(
             (
               await client.query(
-                `SELECT count(*)::int count FROM game_attempts WHERE assignment_id=$1`,
+                `SELECT count(*)::int count FROM game_attempts WHERE assignment_id=$1 AND status<>'cancelled'`,
                 [existingRow.id],
               )
             ).rows[0]?.count ?? 0,
@@ -451,7 +451,7 @@ huntRouter.get(
     }
 
     const attempts = await query<{ count: number }>(
-      `SELECT count(*)::int count FROM game_attempts WHERE assignment_id=$1`,
+      `SELECT count(*)::int count FROM game_attempts WHERE assignment_id=$1 AND status<>'cancelled'`,
       [assignmentId],
     );
     const active = await query<{ id: string; started_at: string }>(
@@ -529,11 +529,16 @@ huntRouter.post(
         `${assignmentSelect} WHERE a.id=$1`,
         [assignmentId],
       );
-      return refreshed.rows[0]!;
+      const attempts = await client.query<{ count: number }>(
+        `SELECT count(*) FILTER(WHERE status<>'cancelled')::int count
+         FROM game_attempts WHERE assignment_id=$1`,
+        [assignmentId],
+      );
+      return { assignment: refreshed.rows[0]!, attemptCount: attempts.rows[0]?.count ?? 0 };
     });
 
     response.json({
-      data: assignmentResponse(updated, 0, null),
+      data: assignmentResponse(updated.assignment, updated.attemptCount, null),
     });
   }),
 );
@@ -593,8 +598,13 @@ huntRouter.post(
         count: number;
         last_ended_at: string | null;
         active: number;
+        last_attempt_number: number;
       }>(
-        `SELECT count(*)::int count,max(ended_at) last_ended_at,count(*) FILTER(WHERE status='in_progress')::int active FROM game_attempts WHERE assignment_id=$1`,
+        `SELECT count(*) FILTER(WHERE status<>'cancelled')::int count,
+           max(ended_at) FILTER(WHERE status IN ('failed','expired')) last_ended_at,
+           count(*) FILTER(WHERE status='in_progress')::int active,
+           COALESCE(max(attempt_number),0)::int last_attempt_number
+         FROM game_attempts WHERE assignment_id=$1`,
         [assignmentId],
       );
       const h = history.rows[0]!;
@@ -619,7 +629,7 @@ huntRouter.post(
       }
       const inserted = await client.query(
         `INSERT INTO game_attempts(assignment_id,team_id,participant_id,attempt_number,start_idempotency_key) VALUES ($1,$2,$3,$4,$5) RETURNING id,status,started_at,attempt_number`,
-        [assignmentId, participant.teamId, participant.userId, h.count + 1, key],
+        [assignmentId, participant.teamId, participant.userId, h.last_attempt_number + 1, key],
       );
       return inserted.rows[0];
     });

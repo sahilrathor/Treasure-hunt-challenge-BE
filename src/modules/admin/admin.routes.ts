@@ -399,6 +399,159 @@ adminRouter.post(
   }),
 );
 
+adminRouter.patch(
+  '/admin/events/:eventId/checkpoint-count',
+  asyncRoute(async (request, response) => {
+    const admin = requireAdmin(request);
+    const eventId = uuid.parse(request.params.eventId);
+    const { checkpointCount } = z
+      .object({ checkpointCount: z.number().int().min(1).max(8) })
+      .parse(request.body);
+
+    const result = await withTransaction(async (client) => {
+      const event = await client.query<{ status: string; checkpoint_count: number }>(
+        `SELECT status,COALESCE((settings->>'checkpointCount')::int,8) checkpoint_count
+         FROM events WHERE id=$1 FOR UPDATE`,
+        [eventId],
+      );
+      if (!event.rows[0]) throw new HttpError(404, 'EVENT_NOT_FOUND', 'Event not found.');
+      if (event.rows[0].status === 'FINISHED') {
+        throw new HttpError(409, 'EVENT_FINISHED', 'Checkpoints cannot be changed after the hunt ends.');
+      }
+      const previousCount = event.rows[0].checkpoint_count;
+      if (checkpointCount === previousCount) {
+        return { previousCount, checkpoints: [] };
+      }
+
+      if (checkpointCount < previousCount) {
+        const blocked = await client.query<{ code: string }>(
+          `SELECT t.code FROM teams t JOIN team_progress tp ON tp.team_id=t.id
+           WHERE t.event_id=$1 AND t.active
+             AND (tp.status='COMPLETED' OR tp.current_sequence>$2)
+           ORDER BY t.code LIMIT 1`,
+          [eventId, checkpointCount],
+        );
+        if (blocked.rows[0]) {
+          throw new HttpError(
+            409,
+            'CHECKPOINTS_IN_USE',
+            `Checkpoint count cannot be reduced because team ${blocked.rows[0].code} has already progressed beyond it.`,
+          );
+        }
+
+        const assigned = await client.query<{ id: string }>(
+          `SELECT a.id FROM game_assignments a JOIN rounds r ON r.id=a.round_id
+           WHERE r.event_id=$1 AND r.sequence>$2 LIMIT 1`,
+          [eventId, checkpointCount],
+        );
+        if (assigned.rows[0]) {
+          throw new HttpError(
+            409,
+            'CHECKPOINTS_IN_USE',
+            'Checkpoint count cannot be reduced because a removed checkpoint already has game activity.',
+          );
+        }
+
+        const removed = await client.query<{ checkpoint_id: string }>(
+          `DELETE FROM rounds WHERE event_id=$1 AND sequence>$2 RETURNING checkpoint_id`,
+          [eventId, checkpointCount],
+        );
+        if (removed.rows.length) {
+          await client.query(`DELETE FROM checkpoints WHERE id=ANY($1::uuid[])`, [
+            removed.rows.map((row) => row.checkpoint_id),
+          ]);
+        }
+      }
+
+      const checkpoints: Array<{ id: string; label: string; sequence: number; scanUrl: string }> = [];
+      if (checkpointCount > previousCount) {
+        for (let sequence = previousCount + 1; sequence <= checkpointCount; sequence += 1) {
+          const token = createToken(24);
+          const checkpoint = await client.query<{ id: string; label: string }>(
+            `INSERT INTO checkpoints(event_id,code,label,qr_token_hash)
+             VALUES ($1,$2,$3,$4) RETURNING id,label`,
+            [eventId, `CP-${sequence}`, `Checkpoint ${sequence}`, hashToken(token)],
+          );
+          const difficulty =
+            sequence <= Math.ceil(checkpointCount / 3)
+              ? 'easy'
+              : sequence <= Math.ceil((checkpointCount * 2) / 3)
+                ? 'medium'
+                : 'hard';
+          await client.query(
+            `INSERT INTO rounds(event_id,checkpoint_id,sequence,clue,difficulty)
+             VALUES ($1,$2,$3,$4,$5)`,
+            [
+              eventId,
+              checkpoint.rows[0]!.id,
+              sequence,
+              `Proceed to Checkpoint ${sequence}.`,
+              difficulty,
+            ],
+          );
+          checkpoints.push({
+            id: checkpoint.rows[0]!.id,
+            label: checkpoint.rows[0]!.label,
+            sequence,
+            scanUrl: `${env.FRONTEND_ORIGIN}/scan?token=${encodeURIComponent(token)}`,
+          });
+        }
+      }
+
+      await client.query(
+        `UPDATE events SET settings=settings || jsonb_build_object('checkpointCount',$2::int) WHERE id=$1`,
+        [eventId, checkpointCount],
+      );
+      return { previousCount, checkpoints };
+    });
+
+    await audit(admin.userId, 'CHANGE_CHECKPOINT_COUNT', 'event', eventId, eventId, {
+      previousCount: result.previousCount,
+      checkpointCount,
+    });
+    response.json({ data: { checkpointCount, checkpoints: result.checkpoints } });
+  }),
+);
+
+adminRouter.post(
+  '/admin/assignments/:assignmentId/attempts/reset',
+  asyncRoute(async (request, response) => {
+    const admin = requireAdmin(request);
+    const assignmentId = uuid.parse(request.params.assignmentId);
+    const result = await withTransaction(async (client) => {
+      const assignment = await client.query<{
+        event_id: string;
+        team_id: string;
+        status: string;
+      }>(
+        `SELECT t.event_id,a.team_id,a.status FROM game_assignments a
+         JOIN teams t ON t.id=a.team_id JOIN events e ON e.id=t.event_id
+         WHERE a.id=$1 AND e.status<>'FINISHED' FOR UPDATE OF a`,
+        [assignmentId],
+      );
+      if (!assignment.rows[0]) {
+        throw new HttpError(404, 'ASSIGNMENT_NOT_FOUND', 'Active assignment not found.');
+      }
+      if (assignment.rows[0].status !== 'ASSIGNED') {
+        throw new HttpError(409, 'ASSIGNMENT_CLOSED', 'Attempts can only be reset for an active assignment.');
+      }
+      const reset = await client.query(
+        `UPDATE game_attempts SET status='cancelled',ended_at=COALESCE(ended_at,now()),
+           duration_ms=COALESCE(duration_ms,(extract(epoch FROM(now()-started_at))*1000)::bigint),
+           result_metadata=jsonb_build_object('reason','admin_reset')
+         WHERE assignment_id=$1 AND status<>'cancelled'`,
+        [assignmentId],
+      );
+      return { ...assignment.rows[0], resetCount: reset.rowCount ?? 0 };
+    });
+    await audit(admin.userId, 'RESET_ATTEMPTS', 'game_assignment', assignmentId, result.event_id, {
+      teamId: result.team_id,
+      resetCount: result.resetCount,
+    });
+    response.json({ data: { assignmentId, resetCount: result.resetCount } });
+  }),
+);
+
 adminRouter.post(
   '/admin/teams',
   asyncRoute(async (request, response) => {
