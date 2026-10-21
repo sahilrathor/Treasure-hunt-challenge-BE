@@ -94,6 +94,8 @@ adminRouter.get(
       ),
       query(
         `SELECT c.id, c.label, r.id AS round_id, r.sequence, r.difficulty, r.clue,
+                COALESCE((SELECT jsonb_object_agg(trc.team_id::text, trc.clue)
+                  FROM team_round_clues trc WHERE trc.round_id=r.id), '{}'::jsonb) AS team_clues,
                 r.game_id, g.name AS game_name, g.code AS game_code
          FROM checkpoints c
          JOIN rounds r ON r.checkpoint_id=c.id
@@ -1078,6 +1080,7 @@ adminRouter.post(
     const eventId = uuid.parse(request.params.eventId);
     const input = z
       .object({
+        teamId: uuid,
         clues: z.array(
           z.object({
             roundId: uuid,
@@ -1096,15 +1099,28 @@ adminRouter.post(
       if (event.rows[0].status === 'FINISHED')
         throw new HttpError(409, 'EVENT_FINISHED', 'Cannot modify clues for a finished event.');
 
+      const team = await client.query(
+        `SELECT id FROM teams WHERE id=$1 AND event_id=$2 AND active`,
+        [input.teamId, eventId],
+      );
+      if (!team.rows[0])
+        throw new HttpError(404, 'TEAM_NOT_FOUND', 'Team not found in this event.');
+
       for (const item of input.clues) {
-        await client.query(
-          `UPDATE rounds SET clue=$2 WHERE id=$1 AND event_id=$3`,
-          [item.roundId, item.clue, eventId],
+        const saved = await client.query(
+          `INSERT INTO team_round_clues(team_id,round_id,clue,updated_at)
+           SELECT $1,r.id,$3,now() FROM rounds r WHERE r.id=$2 AND r.event_id=$4
+           ON CONFLICT (team_id,round_id) DO UPDATE SET clue=EXCLUDED.clue,updated_at=now()
+           RETURNING round_id`,
+          [input.teamId, item.roundId, item.clue, eventId],
         );
+        if (!saved.rows[0])
+          throw new HttpError(404, 'ROUND_NOT_FOUND', 'A round was not found in this event.');
       }
     });
 
     await audit(admin.userId, 'UPDATE_CLUES', 'event', eventId, eventId, {
+      teamId: input.teamId,
       count: input.clues.length,
     });
     response.json({ data: { updated: true } });

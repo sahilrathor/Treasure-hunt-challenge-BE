@@ -752,7 +752,11 @@ huntRouter.get(
   asyncRoute(async (request, response) => {
     const participant = requireParticipant(request);
     const result = await query(
-      `SELECT tp.status,tp.current_sequence,r.clue,r.sequence FROM team_progress tp LEFT JOIN rounds r ON r.event_id=$2 AND r.sequence=tp.current_sequence WHERE tp.team_id=$1`,
+      `SELECT tp.status,tp.current_sequence,COALESCE(trc.clue,r.clue) AS clue,r.sequence
+       FROM team_progress tp
+       LEFT JOIN rounds r ON r.event_id=$2 AND r.sequence=tp.current_sequence
+       LEFT JOIN team_round_clues trc ON trc.team_id=tp.team_id AND trc.round_id=r.id
+       WHERE tp.team_id=$1`,
       [participant.teamId, participant.eventId],
     );
     const row = result.rows[0];

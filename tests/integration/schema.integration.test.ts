@@ -22,7 +22,17 @@ describe.skipIf(process.env.RUN_DB_TESTS !== 'true')('PostgreSQL schema', () => 
       SELECT table_name FROM information_schema.tables
       WHERE table_schema='public' AND table_name = ANY($1::text[])
     `,
-      [['events', 'teams', 'participants', 'game_assignments', 'game_attempts', 'team_progress']],
+      [
+        [
+          'events',
+          'teams',
+          'participants',
+          'game_assignments',
+          'game_attempts',
+          'team_progress',
+          'team_round_clues',
+        ],
+      ],
     );
     expect(tables.rows.map((row) => row.table_name).sort()).toEqual([
       'events',
@@ -30,6 +40,7 @@ describe.skipIf(process.env.RUN_DB_TESTS !== 'true')('PostgreSQL schema', () => 
       'game_attempts',
       'participants',
       'team_progress',
+      'team_round_clues',
       'teams',
     ]);
     expect(
