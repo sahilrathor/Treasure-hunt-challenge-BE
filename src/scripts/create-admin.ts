@@ -6,7 +6,7 @@ import { pool, query } from '../db/pool.js';
 const input = z
   .object({
     username: z.string().trim().min(3).max(64).regex(/^[A-Za-z0-9@._-]+$/),
-    password: z.string().min(12),
+    password: z.string().min(8),
     name: z.string().min(2),
   })
   .parse({

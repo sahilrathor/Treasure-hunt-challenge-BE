@@ -787,7 +787,7 @@ adminRouter.patch(
     const admin = requireAdmin(request);
     const input = z
       .object({
-        password: z.string().min(6).max(200),
+        password: z.string().min(8).max(200),
       })
       .parse(request.body);
     const passwordHash = await argon2.hash(input.password, { type: argon2.argon2id });
@@ -812,7 +812,7 @@ adminRouter.patch(
           .min(3)
           .max(64)
           .regex(/^[A-Za-z0-9@._-]+$/),
-        password: z.string().min(6).max(200),
+        password: z.string().min(8).max(200),
       })
       .parse(request.body);
 
