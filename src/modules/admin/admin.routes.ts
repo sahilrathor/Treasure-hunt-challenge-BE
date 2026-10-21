@@ -296,6 +296,52 @@ adminRouter.post(
   }),
 );
 
+adminRouter.post(
+  '/admin/events/:eventId/new-hunt',
+  asyncRoute(async (request, response) => {
+    const admin = requireAdmin(request);
+    const sourceEventId = uuid.parse(request.params.eventId);
+    const suffix = `${Date.now().toString(36)}-${randomInt(1000, 10000)}`;
+    const created = await withTransaction(async (client) => {
+      const source = await client.query<{
+        name: string;
+        slug: string;
+        settings: Record<string, unknown>;
+        status: string;
+      }>(`SELECT name,slug,settings,status FROM events WHERE id=$1 FOR UPDATE`, [sourceEventId]);
+      if (!source.rows[0]) throw new HttpError(404, 'EVENT_NOT_FOUND', 'Event not found.');
+      if (source.rows[0].status !== 'FINISHED')
+        throw new HttpError(
+          409,
+          'INVALID_EVENT_STATE',
+          'A new hunt can only be created from a finished event.',
+        );
+
+      const existingDraft = await client.query<{ id: string }>(
+        `SELECT id FROM events WHERE status='DRAFT' LIMIT 1`,
+      );
+      if (existingDraft.rows[0])
+        throw new HttpError(409, 'DRAFT_EXISTS', 'Finish setting up the existing draft hunt first.');
+
+      const result = await client.query<{ id: string; name: string; slug: string }>(
+        `INSERT INTO events(name,slug,settings)
+         VALUES ($1,$2,$3) RETURNING id,name,slug`,
+        [
+          `${source.rows[0].name.slice(0, 109)} - New Hunt`,
+          `${source.rows[0].slug.slice(0, 60)}-new-${suffix}`,
+          source.rows[0].settings,
+        ],
+      );
+      return result.rows[0]!;
+    });
+
+    await audit(admin.userId, 'CREATE_NEW_HUNT', 'event', created.id, created.id, {
+      sourceEventId,
+    });
+    response.status(201).json({ data: created });
+  }),
+);
+
 adminRouter.patch(
   '/admin/events/:eventId',
   asyncRoute(async (request, response) => {
@@ -323,11 +369,11 @@ adminRouter.post(
     const eventId = uuid.parse(request.params.eventId);
     const { action, reason } = z
       .object({
-        action: z.enum(['START', 'PAUSE', 'RESUME', 'FINISH']),
+        action: z.enum(['START', 'PAUSE', 'RESUME', 'FINISH', 'RESTART']),
         reason: z.string().max(500).optional(),
       })
       .parse(request.body);
-    await withTransaction(async (client) => {
+    const reset = await withTransaction(async (client) => {
       const event = await client.query<{ status: string }>(
         `SELECT status FROM events WHERE id=$1 FOR UPDATE`,
         [eventId],
@@ -384,7 +430,7 @@ adminRouter.post(
           [eventId],
         );
         await client.query(`UPDATE events SET status='RUNNING' WHERE id=$1`, [eventId]);
-      } else {
+      } else if (action === 'FINISH') {
         if (!['RUNNING', 'PAUSED'].includes(event.rows[0].status))
           throw new HttpError(409, 'INVALID_EVENT_STATE', 'This event cannot finish.');
         await client.query(
@@ -394,10 +440,46 @@ adminRouter.post(
         await client.query(`UPDATE events SET status='FINISHED',ends_at=now() WHERE id=$1`, [
           eventId,
         ]);
+      } else {
+        if (event.rows[0].status !== 'FINISHED')
+          throw new HttpError(409, 'INVALID_EVENT_STATE', 'Only a finished hunt can restart.');
+
+        const attempts = await client.query(
+          `DELETE FROM game_attempts ga USING teams t
+           WHERE ga.team_id=t.id AND t.event_id=$1`,
+          [eventId],
+        );
+        const assignments = await client.query(
+          `DELETE FROM game_assignments a USING teams t
+           WHERE a.team_id=t.id AND t.event_id=$1`,
+          [eventId],
+        );
+        const teams = await client.query(
+          `UPDATE team_progress tp
+           SET current_sequence=1,status='NOT_STARTED',started_at=NULL,completed_at=NULL,updated_at=now()
+           FROM teams t WHERE tp.team_id=t.id AND t.event_id=$1`,
+          [eventId],
+        );
+        await client.query(`DELETE FROM event_pauses WHERE event_id=$1`, [eventId]);
+        await client.query(
+          `UPDATE sessions s SET revoked_at=now() FROM participants p
+           WHERE s.participant_id=p.id AND p.event_id=$1 AND s.revoked_at IS NULL`,
+          [eventId],
+        );
+        await client.query(
+          `UPDATE events SET status='DRAFT',starts_at=NULL,ends_at=NULL WHERE id=$1`,
+          [eventId],
+        );
+        return {
+          attempts: attempts.rowCount ?? 0,
+          assignments: assignments.rowCount ?? 0,
+          teams: teams.rowCount ?? 0,
+        };
       }
+      return null;
     });
-    await audit(admin.userId, action, 'event', eventId, eventId, { reason });
-    response.json({ data: { eventId, action } });
+    await audit(admin.userId, action, 'event', eventId, eventId, { reason, reset });
+    response.json({ data: { eventId, action, reset } });
   }),
 );
 
@@ -411,8 +493,13 @@ adminRouter.patch(
       .parse(request.body);
 
     const result = await withTransaction(async (client) => {
-      const event = await client.query<{ status: string; checkpoint_count: number }>(
-        `SELECT status,COALESCE((settings->>'checkpointCount')::int,8) checkpoint_count
+      const event = await client.query<{
+        status: string;
+        checkpoint_count: number;
+        actual_checkpoint_count: number;
+      }>(
+        `SELECT status,COALESCE((settings->>'checkpointCount')::int,8) checkpoint_count,
+           (SELECT count(*)::int FROM rounds WHERE event_id=$1) actual_checkpoint_count
          FROM events WHERE id=$1 FOR UPDATE`,
         [eventId],
       );
@@ -420,7 +507,7 @@ adminRouter.patch(
       if (event.rows[0].status === 'FINISHED') {
         throw new HttpError(409, 'EVENT_FINISHED', 'Checkpoints cannot be changed after the hunt ends.');
       }
-      const previousCount = event.rows[0].checkpoint_count;
+      const previousCount = event.rows[0].actual_checkpoint_count;
       if (checkpointCount === previousCount) {
         return { previousCount, checkpoints: [] };
       }
