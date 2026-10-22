@@ -57,6 +57,21 @@ paths:
       summary: Return completed and incomplete team standings
       responses:
         '200': { description: Standings }
+  /admin/teams/{teamId}:
+    patch:
+      summary: Update a team's name or code during draft setup
+      parameters:
+        - { name: teamId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Updated team }
+        '409': { description: Hunt has already started }
+    delete:
+      summary: Delete a team and its member accounts during draft setup
+      parameters:
+        - { name: teamId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '204': { description: Team deleted }
+        '409': { description: Hunt has already started }
 components:
   securitySchemes:
     sessionCookie:

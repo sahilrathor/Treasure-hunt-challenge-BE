@@ -670,6 +670,71 @@ adminRouter.get(
   }),
 );
 
+adminRouter.patch(
+  '/admin/teams/:teamId',
+  asyncRoute(async (request, response) => {
+    const admin = requireAdmin(request);
+    const teamId = uuid.parse(request.params.teamId);
+    const input = z
+      .object({
+        code: z.string().trim().min(2).max(30).optional(),
+        name: z.string().trim().min(2).max(100).optional(),
+      })
+      .refine((value) => value.code !== undefined || value.name !== undefined, {
+        message: 'Provide a team code or name to update.',
+      })
+      .parse(request.body);
+    const result = await query<{ event_id: string; code: string; name: string }>(
+      `UPDATE teams t
+       SET code=COALESCE($2,t.code),name=COALESCE($3,t.name)
+       FROM events e
+       WHERE t.id=$1 AND e.id=t.event_id AND e.status='DRAFT'
+       RETURNING t.event_id,t.code,t.name`,
+      [teamId, input.code ?? null, input.name ?? null],
+    );
+    if (!result.rows[0]) {
+      throw new HttpError(
+        409,
+        'TEAM_NOT_EDITABLE',
+        'Teams can only be edited before the hunt starts.',
+      );
+    }
+    await audit(admin.userId, 'UPDATE', 'team', teamId, result.rows[0].event_id, input);
+    response.json({ data: { id: teamId, code: result.rows[0].code, name: result.rows[0].name } });
+  }),
+);
+
+adminRouter.delete(
+  '/admin/teams/:teamId',
+  asyncRoute(async (request, response) => {
+    const admin = requireAdmin(request);
+    const teamId = uuid.parse(request.params.teamId);
+    const eventId = await withTransaction(async (client) => {
+      const team = await client.query<{ event_id: string }>(
+        `SELECT t.event_id FROM teams t JOIN events e ON e.id=t.event_id
+         WHERE t.id=$1 AND e.status='DRAFT' FOR UPDATE OF t`,
+        [teamId],
+      );
+      if (!team.rows[0]) {
+        throw new HttpError(
+          409,
+          'TEAM_NOT_DELETABLE',
+          'Teams can only be deleted before the hunt starts.',
+        );
+      }
+      await client.query(
+        `DELETE FROM sessions WHERE participant_id IN (SELECT id FROM participants WHERE team_id=$1)`,
+        [teamId],
+      );
+      await client.query(`DELETE FROM participants WHERE team_id=$1`, [teamId]);
+      await client.query(`DELETE FROM teams WHERE id=$1`, [teamId]);
+      return team.rows[0].event_id;
+    });
+    await audit(admin.userId, 'DELETE', 'team', teamId, eventId, {});
+    response.status(204).end();
+  }),
+);
+
 adminRouter.get(
   '/admin/teams/:teamId/rounds',
   asyncRoute(async (request, response) => {
