@@ -4,6 +4,7 @@ import { z } from 'zod';
 
 import { env } from '../../config/env.js';
 import { query } from '../../db/pool.js';
+import { withTransaction } from '../../db/transaction.js';
 import { authenticate, readSessionToken } from '../../middleware/authenticate.js';
 import { createToken, hashToken } from '../../utils/crypto.js';
 import { HttpError } from '../../utils/http-error.js';
@@ -12,17 +13,18 @@ import { asyncRoute } from '../../utils/route.js';
 const loginSchema = z.object({
   identifier: z.string().trim().min(1).max(254),
   password: z.string().min(1).max(200),
+  qrToken: z.string().min(16).max(200).optional(),
 });
 
 const cookieName = 'hunt_session';
 const cookieOptions = () =>
   `HttpOnly; Path=/api/v1; SameSite=Lax; Max-Age=${env.SESSION_HOURS * 3600}${env.NODE_ENV === 'production' ? '; Secure' : ''}`;
 
-async function createSession(owner: { participantId?: string; adminId?: string }) {
+async function createSession(owner: { participantId?: string; adminId?: string; scanTokenHash?: string }) {
   const token = createToken();
   await query(
-    `INSERT INTO sessions(token_hash, participant_id, admin_id, expires_at) VALUES ($1,$2,$3,now() + ($4 || ' hours')::interval)`,
-    [hashToken(token), owner.participantId ?? null, owner.adminId ?? null, env.SESSION_HOURS],
+    `INSERT INTO sessions(token_hash, participant_id, admin_id, scan_token_hash, expires_at) VALUES ($1,$2,$3,$4,now() + ($5 || ' hours')::interval)`,
+    [hashToken(token), owner.participantId ?? null, owner.adminId ?? null, owner.scanTokenHash ?? null, env.SESSION_HOURS],
   );
   return token;
 }
@@ -41,9 +43,9 @@ authRouter.post(
     if (admin.rows[0] && (await argon2.verify(admin.rows[0].password_hash, input.password))) {
       token = await createSession({ adminId: admin.rows[0].id });
     } else {
-      const participant = await query<{ id: string; password_hash: string }>(
+      const participant = await query<{ id: string; team_id: string; password_hash: string }>(
         `
-      SELECT p.id, p.password_hash FROM participants p JOIN events e ON e.id = p.event_id
+      SELECT p.id, p.team_id, p.password_hash FROM participants p JOIN events e ON e.id = p.event_id
       WHERE p.member_code = $1 AND p.active AND e.status IN ('RUNNING','PAUSED','DRAFT')
       ORDER BY CASE e.status WHEN 'RUNNING' THEN 1 WHEN 'PAUSED' THEN 2 ELSE 3 END,e.created_at DESC
       LIMIT 1
@@ -56,7 +58,47 @@ authRouter.post(
       ) {
         throw new HttpError(401, 'INVALID_CREDENTIALS', 'Invalid username or password.');
       }
-      token = await createSession({ participantId: participant.rows[0].id });
+      const selected = participant.rows[0];
+      token = await withTransaction(async (client) => {
+        await client.query(`SELECT id FROM teams WHERE id=$1 FOR UPDATE`, [selected.team_id]);
+        const active = await client.query<{ participant_id: string }>(
+          `SELECT s.participant_id FROM sessions s JOIN participants p ON p.id=s.participant_id
+           WHERE p.team_id=$1 AND s.revoked_at IS NULL AND s.expires_at>now()
+           ORDER BY (s.participant_id<>$2) DESC LIMIT 1`,
+          [selected.team_id, selected.id],
+        );
+        if (active.rows[0] && active.rows[0].participant_id !== selected.id) {
+          throw new HttpError(
+            409,
+            'TEAM_ALREADY_LOGGED_IN',
+            'Another player from your team is already logged in.',
+          );
+        }
+        await client.query(
+          `UPDATE sessions SET revoked_at=now()
+           WHERE participant_id=$1 AND revoked_at IS NULL AND expires_at>now()`,
+          [selected.id],
+        );
+        let scanTokenHash: string | undefined;
+        if (input.qrToken) {
+          scanTokenHash = hashToken(input.qrToken);
+          const qr = await client.query(
+            `SELECT q.id FROM team_checkpoint_qrs q JOIN checkpoints c ON c.id=q.checkpoint_id
+             WHERE q.team_id=$1 AND q.qr_token_hash=$2 AND c.active`,
+            [selected.team_id, scanTokenHash],
+          );
+          if (!qr.rows[0]) {
+            throw new HttpError(403, 'INVALID_TEAM_QR', 'This QR code belongs to a different team.');
+          }
+        }
+        const sessionToken = createToken();
+        await client.query(
+          `INSERT INTO sessions(token_hash,participant_id,scan_token_hash,expires_at)
+           VALUES ($1,$2,$3,now() + ($4 || ' hours')::interval)`,
+          [hashToken(sessionToken), selected.id, scanTokenHash ?? null, env.SESSION_HOURS],
+        );
+        return sessionToken;
+      });
     }
     response.setHeader(
       'Set-Cookie',
@@ -100,5 +142,17 @@ authRouter.post(
 );
 
 authRouter.get('/me', authenticate, (request, response) => {
-  response.json({ data: request.auth });
+  const identity = request.auth!;
+  response.json({
+    data: {
+      sessionId: identity.sessionId,
+      userId: identity.userId,
+      role: identity.role,
+      displayName: identity.displayName,
+      username: identity.username,
+      eventId: identity.eventId,
+      teamId: identity.teamId,
+      memberCode: identity.memberCode,
+    },
+  });
 });

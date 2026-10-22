@@ -140,14 +140,12 @@ adminRouter.post(
         await client.query(`DELETE FROM checkpoints WHERE event_id=$1`, [current.id]);
       }
 
-      const checkpoints: Array<{ id: string; label: string; sequence: number; scanUrl: string }> =
-        [];
+      const checkpoints: Array<{ id: string; label: string; sequence: number }> = [];
       for (let sequence = 1; sequence <= checkpointCount; sequence += 1) {
-        const token = createToken(24);
         const checkpoint = await client.query<{ id: string; label: string }>(
           `INSERT INTO checkpoints(event_id,code,label,qr_token_hash)
            VALUES ($1,$2,$3,$4) RETURNING id,label`,
-          [current.id, `CP-${sequence}`, `Checkpoint ${sequence}`, hashToken(token)],
+          [current.id, `CP-${sequence}`, `Checkpoint ${sequence}`, hashToken(createToken(24))],
         );
         const difficulty =
           sequence <= Math.ceil(checkpointCount / 3)
@@ -170,7 +168,6 @@ adminRouter.post(
           id: checkpoint.rows[0]!.id,
           label: checkpoint.rows[0]!.label,
           sequence,
-          scanUrl: `${env.FRONTEND_ORIGIN}/scan?token=${encodeURIComponent(token)}`,
         });
       }
       return { eventId: current.id, eventSlug: current.slug, checkpoints };
@@ -552,14 +549,13 @@ adminRouter.patch(
         }
       }
 
-      const checkpoints: Array<{ id: string; label: string; sequence: number; scanUrl: string }> = [];
+      const checkpoints: Array<{ id: string; label: string; sequence: number }> = [];
       if (checkpointCount > previousCount) {
         for (let sequence = previousCount + 1; sequence <= checkpointCount; sequence += 1) {
-          const token = createToken(24);
           const checkpoint = await client.query<{ id: string; label: string }>(
             `INSERT INTO checkpoints(event_id,code,label,qr_token_hash)
              VALUES ($1,$2,$3,$4) RETURNING id,label`,
-            [eventId, `CP-${sequence}`, `Checkpoint ${sequence}`, hashToken(token)],
+            [eventId, `CP-${sequence}`, `Checkpoint ${sequence}`, hashToken(createToken(24))],
           );
           const difficulty =
             sequence <= Math.ceil(checkpointCount / 3)
@@ -582,7 +578,6 @@ adminRouter.patch(
             id: checkpoint.rows[0]!.id,
             label: checkpoint.rows[0]!.label,
             sequence,
-            scanUrl: `${env.FRONTEND_ORIGIN}/scan?token=${encodeURIComponent(token)}`,
           });
         }
       }
@@ -929,20 +924,15 @@ adminRouter.post(
   asyncRoute(async (request, response) => {
     const admin = requireAdmin(request);
     const input = checkpointSchema.parse(request.body);
-    const token = createToken(24);
     const result = await query<{ id: string }>(
       `INSERT INTO checkpoints(event_id,code,label,qr_token_hash) VALUES ($1,$2,$3,$4) RETURNING id`,
-      [input.eventId, input.code, input.label, hashToken(token)],
+      [input.eventId, input.code, input.label, hashToken(createToken(24))],
     );
     await audit(admin.userId, 'CREATE', 'checkpoint', result.rows[0]!.id, input.eventId, {
       code: input.code,
     });
     response.status(201).json({
-      data: {
-        id: result.rows[0]!.id,
-        qrToken: token,
-        scanUrl: `${env.FRONTEND_ORIGIN}/scan?token=${encodeURIComponent(token)}`,
-      },
+      data: { id: result.rows[0]!.id },
     });
   }),
 );
@@ -957,17 +947,21 @@ adminRouter.patch(
         label: z.string().min(2).max(120).optional(),
         active: z.boolean().optional(),
         rotateToken: z.boolean().optional(),
+        teamId: uuid.optional(),
         clue: z.string().trim().min(1).max(1000).optional(),
         difficulty: z.enum(['easy', 'medium', 'hard']).optional(),
       })
       .parse(request.body);
+    if (input.rotateToken && !input.teamId) {
+      throw new HttpError(400, 'TEAM_REQUIRED', 'Choose a team before generating a QR code.');
+    }
     const token = input.rotateToken ? createToken(24) : null;
     const result = await query<{ event_id: string }>(
       `UPDATE checkpoints c
-       SET label=COALESCE($2,c.label),active=COALESCE($3,c.active),qr_token_hash=COALESCE($4,c.qr_token_hash)
+       SET label=COALESCE($2,c.label),active=COALESCE($3,c.active)
        FROM events e WHERE c.id=$1 AND e.id=c.event_id AND e.status<>'FINISHED'
        RETURNING c.event_id`,
-      [checkpointId, input.label ?? null, input.active ?? null, token ? hashToken(token) : null],
+      [checkpointId, input.label ?? null, input.active ?? null],
     );
     if (!result.rows[0])
       throw new HttpError(
@@ -990,6 +984,22 @@ adminRouter.patch(
       );
     }
 
+    if (token && input.teamId) {
+      const qr = await query(
+        `INSERT INTO team_checkpoint_qrs(team_id,checkpoint_id,qr_token_hash)
+         SELECT t.id,c.id,$3 FROM teams t JOIN checkpoints c ON c.event_id=t.event_id
+         JOIN events e ON e.id=t.event_id
+         WHERE t.id=$1 AND c.id=$2 AND t.active AND e.status<>'FINISHED'
+         ON CONFLICT(team_id,checkpoint_id) DO UPDATE
+         SET qr_token_hash=EXCLUDED.qr_token_hash,updated_at=now()
+         RETURNING id`,
+        [input.teamId, checkpointId, hashToken(token)],
+      );
+      if (!qr.rows[0]) {
+        throw new HttpError(404, 'TEAM_NOT_FOUND', 'The selected team is unavailable.');
+      }
+    }
+
     await audit(admin.userId, 'UPDATE', 'checkpoint', checkpointId, result.rows[0].event_id, input);
     response.json({
       data: {
@@ -998,6 +1008,7 @@ adminRouter.patch(
           ? {
               qrToken: token,
               scanUrl: `${env.FRONTEND_ORIGIN}/scan?token=${encodeURIComponent(token)}`,
+              teamId: input.teamId,
             }
           : {}),
         ...(input.clue !== undefined ? { clue: input.clue } : {}),

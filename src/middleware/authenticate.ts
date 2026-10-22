@@ -13,6 +13,7 @@ export interface AuthIdentity {
   eventId: string | null;
   teamId: string | null;
   memberCode: string | null;
+  scanTokenHash: string | null;
 }
 
 declare global {
@@ -46,6 +47,7 @@ export const authenticate: RequestHandler = async (request, _response, next) => 
       event_id: string | null;
       team_id: string | null;
       member_code: string | null;
+      scan_token_hash: string | null;
     }>(
       `
       SELECT s.id AS session_id,
@@ -53,7 +55,7 @@ export const authenticate: RequestHandler = async (request, _response, next) => 
         CASE WHEN p.id IS NOT NULL THEN 'PARTICIPANT' ELSE a.role END AS role,
         COALESCE(p.display_name, a.display_name) AS display_name,
         a.email AS username,
-        p.event_id, p.team_id, p.member_code
+        p.event_id, p.team_id, p.member_code, s.scan_token_hash
       FROM sessions s
       LEFT JOIN participants p ON p.id = s.participant_id AND p.active
       LEFT JOIN admin_users a ON a.id = s.admin_id AND a.active
@@ -74,6 +76,7 @@ export const authenticate: RequestHandler = async (request, _response, next) => 
       eventId: identity.event_id,
       teamId: identity.team_id,
       memberCode: identity.member_code,
+      scanTokenHash: identity.scan_token_hash,
     };
     next();
   } catch (error) {

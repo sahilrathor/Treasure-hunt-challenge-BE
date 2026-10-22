@@ -248,6 +248,15 @@ huntRouter.post(
   asyncRoute(async (request, response) => {
     const participant = requireParticipant(request);
     const { token } = z.object({ token: z.string().min(16).max(200) }).parse(request.body);
+    const tokenHash = hashToken(token);
+    if (participant.scanTokenHash !== tokenHash) {
+      throw new HttpError(
+        401,
+        'SCAN_LOGIN_REQUIRED',
+        'Log in after scanning this QR code to continue.',
+      );
+    }
+    await query(`UPDATE sessions SET scan_token_hash=NULL WHERE id=$1`, [participant.sessionId]);
     const result = await withTransaction(async (client) => {
       const progress = await client.query<{
         current_sequence: number;
@@ -273,10 +282,13 @@ huntRouter.post(
         game_id: string | null;
       }>(
         `
-      SELECT r.id,r.sequence,r.difficulty,c.label checkpoint_label,r.game_id FROM checkpoints c JOIN rounds r ON r.checkpoint_id=c.id
-      WHERE c.event_id=$1 AND c.qr_token_hash=$2 AND c.active
+      SELECT r.id,r.sequence,r.difficulty,c.label checkpoint_label,r.game_id
+      FROM team_checkpoint_qrs q
+      JOIN checkpoints c ON c.id=q.checkpoint_id
+      JOIN rounds r ON r.checkpoint_id=c.id
+      WHERE c.event_id=$1 AND q.team_id=$2 AND q.qr_token_hash=$3 AND c.active
     `,
-        [participant.eventId, hashToken(token)],
+        [participant.eventId, participant.teamId, tokenHash],
       );
       const currentRound = round.rows[0];
       if (!currentRound)

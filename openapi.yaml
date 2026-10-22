@@ -7,10 +7,12 @@ servers:
 paths:
   /auth/login:
     post:
-      summary: Authenticate a participant or administrator
+      summary: Authenticate a participant or administrator; QR scans include the team QR token
       responses:
         '200': { description: Authenticated; sets an HttpOnly session cookie }
         '401': { description: Invalid credentials }
+        '403': { description: QR does not belong to the participant's team }
+        '409': { description: Another participant from the team is already logged in }
   /me:
     get:
       summary: Return the current identity
@@ -27,9 +29,10 @@ paths:
         '409': { description: Invalid event/team state }
   /checkpoints/scan:
     post:
-      summary: Validate a QR token and return the stable round assignment
+      summary: Consume a fresh-login grant for a team-specific QR and return the round assignment
       responses:
         '200': { description: Assignment }
+        '401': { description: A fresh login after this QR scan is required }
         '409': { description: Wrong checkpoint or progression state }
   /assignments/{assignmentId}/attempts:
     post:
