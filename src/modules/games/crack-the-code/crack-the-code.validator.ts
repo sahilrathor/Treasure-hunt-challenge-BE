@@ -6,19 +6,19 @@ import { createChallengeBinding, verifyChallengeBinding } from '../shared/challe
 import type { Difficulty, GameModule } from '../shared/game.types.js';
 
 const configSchema = z.object({
-  digits: z.number().int().min(3).max(6).default(4),
+  digits: z.number().int().min(3).max(8).default(5),
   maxGuesses: z.number().int().min(3).max(10).default(6),
   maxDigit: z.number().int().min(4).max(9).default(8),
-  allowDuplicates: z.boolean().default(false),
+  allowDuplicates: z.boolean().default(true),
 });
 
 const defaultTargets: Record<
   Difficulty,
   { digits: number; maxGuesses: number; maxDigit: number; allowDuplicates: boolean }
 > = {
-  easy: { digits: 3, maxGuesses: 6, maxDigit: 6, allowDuplicates: false },
-  medium: { digits: 4, maxGuesses: 6, maxDigit: 8, allowDuplicates: false },
-  hard: { digits: 4, maxGuesses: 5, maxDigit: 9, allowDuplicates: true },
+  easy: { digits: 5, maxGuesses: 6, maxDigit: 8, allowDuplicates: true },
+  medium: { digits: 6, maxGuesses: 6, maxDigit: 8, allowDuplicates: true },
+  hard: { digits: 6, maxGuesses: 5, maxDigit: 9, allowDuplicates: true },
 };
 
 export const crackTheCodeModule: GameModule = {
@@ -38,7 +38,7 @@ export const crackTheCodeModule: GameModule = {
       }
     } else {
       for (let i = 0; i < resolved.digits; i++) {
-        code.push(randomInt(resolved.maxDigit + 1));
+        code.push(randomInt(1, resolved.maxDigit + 1));
       }
     }
 

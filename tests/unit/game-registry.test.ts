@@ -151,8 +151,6 @@ describe('deterministic game validators', () => {
     const config = { size: 3, scrambleMoves: 1 };
     const challenge = module.createChallenge(config, 'easy');
     const initialTiles = challenge.secretData.initialTiles as number[];
-    // Find where empty tile 0 is, and find which tile is out of place
-    const emptyIdx = initialTiles.indexOf(0);
     // Because scrambleMoves was 1, sliding the tile at the position where 0 should be back to 0 will solve it
     // Or simpler: pass an invalid move to check false, and solved grid check
     expect(

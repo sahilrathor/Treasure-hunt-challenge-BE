@@ -12,9 +12,9 @@ WITH level_values(code, difficulty, config) AS (
     ('mini-platformer','medium','{"target":5,"speed":4.0,"lives":3}'::jsonb),
     ('mini-platformer','hard','{"target":8,"speed":4.5,"lives":2}'::jsonb),
 
-    ('crack-the-code','easy','{"digits":3,"maxGuesses":6,"maxDigit":6,"allowDuplicates":false}'::jsonb),
-    ('crack-the-code','medium','{"digits":4,"maxGuesses":6,"maxDigit":8,"allowDuplicates":false}'::jsonb),
-    ('crack-the-code','hard','{"digits":4,"maxGuesses":5,"maxDigit":9,"allowDuplicates":true}'::jsonb),
+    ('crack-the-code','easy','{"digits":5,"maxGuesses":6,"maxDigit":8,"allowDuplicates":true}'::jsonb),
+    ('crack-the-code','medium','{"digits":6,"maxGuesses":6,"maxDigit":8,"allowDuplicates":true}'::jsonb),
+    ('crack-the-code','hard','{"digits":6,"maxGuesses":5,"maxDigit":9,"allowDuplicates":true}'::jsonb),
 
     ('sliding-puzzle','easy','{"size":3,"scrambleMoves":12}'::jsonb),
     ('sliding-puzzle','medium','{"size":3,"scrambleMoves":25}'::jsonb),
