@@ -81,15 +81,35 @@ adminRouter.get(
       response.json({ data: { event: null, teams: [], checkpoints: [] } });
       return;
     }
-    const [teams, checkpoints] = await Promise.all([
+    const [teams, checkpoints, activeSessions] = await Promise.all([
       query(
-        `SELECT t.id,t.code,t.name,tp.status,tp.current_sequence,
-         COALESCE(jsonb_agg(jsonb_build_object('id',p.id,'memberCode',p.member_code,'displayName',p.display_name)
-           ORDER BY p.member_code) FILTER (WHERE p.id IS NOT NULL),'[]'::jsonb) participants
-         FROM teams t JOIN team_progress tp ON tp.team_id=t.id
+        `SELECT t.id, t.code, t.name, tp.status, tp.current_sequence,
+         COALESCE(
+           jsonb_agg(
+             jsonb_build_object(
+               'id', p.id,
+               'memberCode', p.member_code,
+               'displayName', p.display_name,
+               'isLoggedIn', (s.id IS NOT NULL),
+               'loggedInAt', s.created_at,
+               'sessionId', s.id
+             )
+             ORDER BY p.member_code
+           ) FILTER (WHERE p.id IS NOT NULL),
+           '[]'::jsonb
+         ) participants
+         FROM teams t
+         JOIN team_progress tp ON tp.team_id=t.id
          LEFT JOIN participants p ON p.team_id=t.id AND p.active
+         LEFT JOIN (
+           SELECT DISTINCT ON (participant_id) id, participant_id, created_at
+           FROM sessions
+           WHERE revoked_at IS NULL AND expires_at > now()
+           ORDER BY participant_id, created_at DESC
+         ) s ON s.participant_id = p.id
          WHERE t.event_id=$1 AND t.active
-         GROUP BY t.id,tp.status,tp.current_sequence ORDER BY t.code`,
+         GROUP BY t.id, tp.status, tp.current_sequence
+         ORDER BY t.code`,
         [current.id],
       ),
       query(
@@ -103,9 +123,43 @@ adminRouter.get(
          WHERE c.event_id=$1 AND c.active ORDER BY r.sequence`,
         [current.id],
       ),
+      query<{
+        session_id: string;
+        logged_in_at: string;
+        participant_id: string;
+        display_name: string;
+        member_code: string;
+        team_id: string;
+        team_name: string;
+        team_code: string;
+      }>(
+        `SELECT s.id AS session_id, s.created_at AS logged_in_at,
+                p.id AS participant_id, p.display_name, p.member_code,
+                t.id AS team_id, t.name AS team_name, t.code AS team_code
+         FROM sessions s
+         JOIN participants p ON p.id = s.participant_id AND p.active
+         JOIN teams t ON t.id = p.team_id AND t.active
+         WHERE t.event_id = $1 AND s.revoked_at IS NULL AND s.expires_at > now()
+         ORDER BY s.created_at DESC`,
+        [current.id],
+      ),
     ]);
     response.json({
-      data: { event: current, teams: teams.rows, checkpoints: checkpoints.rows },
+      data: {
+        event: current,
+        teams: teams.rows,
+        checkpoints: checkpoints.rows,
+        activeSessions: activeSessions.rows.map((row) => ({
+          sessionId: row.session_id,
+          loggedInAt: row.logged_in_at,
+          participantId: row.participant_id,
+          displayName: row.display_name,
+          memberCode: row.member_code,
+          teamId: row.team_id,
+          teamName: row.team_name,
+          teamCode: row.team_code,
+        })),
+      },
     });
   }),
 );
@@ -925,6 +979,30 @@ adminRouter.post(
         password: newPassword,
       },
     });
+  }),
+);
+
+adminRouter.post(
+  '/admin/participants/:participantId/logout',
+  asyncRoute(async (request, response) => {
+    const admin = requireAdmin(request);
+    const participantId = uuid.parse(request.params.participantId);
+    const result = await query<{ event_id: string; member_code: string; display_name: string }>(
+      `SELECT event_id, member_code, display_name FROM participants WHERE id = $1`,
+      [participantId],
+    );
+    if (!result.rows[0]) {
+      throw new HttpError(404, 'PARTICIPANT_NOT_FOUND', 'Participant not found.');
+    }
+    await query(
+      `UPDATE sessions SET revoked_at=now() WHERE participant_id=$1 AND revoked_at IS NULL`,
+      [participantId],
+    );
+    await audit(admin.userId, 'LOGOUT_PARTICIPANT', 'participant', participantId, result.rows[0].event_id, {
+      memberCode: result.rows[0].member_code,
+      displayName: result.rows[0].display_name,
+    });
+    response.json({ data: { id: participantId, loggedOut: true } });
   }),
 );
 
