@@ -17,14 +17,25 @@ const loginSchema = z.object({
 });
 
 const cookieName = 'hunt_session';
-const cookieOptions = () =>
-  `HttpOnly; Path=/api/v1; SameSite=Lax; Max-Age=${env.SESSION_HOURS * 3600}${env.NODE_ENV === 'production' ? '; Secure' : ''}`;
+const cookieSecurity = env.NODE_ENV === 'production' ? 'SameSite=None; Secure' : 'SameSite=Lax';
+const cookieOptions = (maxAge = env.SESSION_HOURS * 3600) =>
+  `HttpOnly; Path=/api/v1; ${cookieSecurity}; Max-Age=${maxAge}`;
 
-async function createSession(owner: { participantId?: string; adminId?: string; scanTokenHash?: string }) {
+async function createSession(owner: {
+  participantId?: string;
+  adminId?: string;
+  scanTokenHash?: string;
+}) {
   const token = createToken();
   await query(
     `INSERT INTO sessions(token_hash, participant_id, admin_id, scan_token_hash, expires_at) VALUES ($1,$2,$3,$4,now() + ($5 || ' hours')::interval)`,
-    [hashToken(token), owner.participantId ?? null, owner.adminId ?? null, owner.scanTokenHash ?? null, env.SESSION_HOURS],
+    [
+      hashToken(token),
+      owner.participantId ?? null,
+      owner.adminId ?? null,
+      owner.scanTokenHash ?? null,
+      env.SESSION_HOURS,
+    ],
   );
   return token;
 }
@@ -88,7 +99,11 @@ authRouter.post(
             [selected.team_id, scanTokenHash],
           );
           if (!qr.rows[0]) {
-            throw new HttpError(403, 'INVALID_TEAM_QR', 'This QR code belongs to a different team.');
+            throw new HttpError(
+              403,
+              'INVALID_TEAM_QR',
+              'This QR code belongs to a different team.',
+            );
           }
         }
         const sessionToken = createToken();
@@ -113,10 +128,7 @@ authRouter.post(
   authenticate,
   asyncRoute(async (request, response) => {
     await query(`UPDATE sessions SET revoked_at = now() WHERE id = $1`, [request.auth!.sessionId]);
-    response.setHeader(
-      'Set-Cookie',
-      `${cookieName}=; HttpOnly; Path=/api/v1; SameSite=Lax; Max-Age=0`,
-    );
+    response.setHeader('Set-Cookie', `${cookieName}=; ${cookieOptions(0)}`);
     response.status(204).end();
   }),
 );

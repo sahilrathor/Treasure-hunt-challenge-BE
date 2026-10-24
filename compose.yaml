@@ -3,10 +3,11 @@ services:
     build:
       context: .
     environment:
-      NODE_ENV: development
+      NODE_ENV: production
       PORT: 3000
       LOG_LEVEL: ${LOG_LEVEL:-info}
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-college_fest_hunt}
+      DATABASE_SSL: disable
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5173}
       SESSION_HOURS: ${SESSION_HOURS:-8}
     ports:
@@ -23,7 +24,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     ports:
-      - '5432:5432'
+      - '127.0.0.1:5432:5432'
     volumes:
       - hunt-postgres:/var/lib/postgresql/data
     healthcheck:

@@ -60,8 +60,8 @@ disposable migrated test database and run with `RUN_DB_TESTS=true npm test`.
 
 ## Data integrity and security
 
-- Opaque random sessions are stored only as SHA-256 hashes and delivered in HttpOnly, SameSite
-  cookies. Production cookies are `Secure`.
+- Opaque random sessions are stored only as SHA-256 hashes and delivered in HttpOnly cookies.
+  Production cookies use `SameSite=None; Secure` for separately hosted HTTPS frontends.
 - Passwords use Argon2id. Disabled users have active sessions revoked.
 - Participant, admin, and ownership checks run on every private route.
 - QR tokens are stored as hashes. Rotating a checkpoint token invalidates the old QR.

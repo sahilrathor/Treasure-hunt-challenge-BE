@@ -7,6 +7,7 @@ const environmentSchema = z.object({
   PORT: z.coerce.number().int().positive().max(65_535).default(3000),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
   DATABASE_URL: z.string().url().startsWith('postgresql://'),
+  DATABASE_SSL: z.enum(['disable', 'require']).optional(),
   FRONTEND_ORIGIN: z.string().url(),
   SESSION_HOURS: z.coerce.number().int().min(1).max(168).default(8),
 });

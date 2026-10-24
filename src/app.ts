@@ -24,6 +24,8 @@ export function createApp(options: AppOptions = {}) {
   const logger = createLogger(options.logLevel ?? 'info');
   const isDev = (options.environment ?? process.env.NODE_ENV) !== 'production';
 
+  if (!isDev) app.set('trust proxy', 1);
+
   const isOriginAllowed = (origin?: string) => {
     if (!origin) return true;
     if (isDev) return true;
