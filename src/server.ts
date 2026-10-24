@@ -4,12 +4,8 @@ import { env } from './config/env.js';
 import { pool } from './db/pool.js';
 import { runSqlFiles } from './scripts/run-sql-files.js';
 
-// Auto-run schema migrations on startup to prevent schema divergence
-try {
-  await runSqlFiles(resolve('database/migrations'), 'schema_migrations');
-} catch (error) {
-  console.error('Failed to run schema migrations on startup:', error);
-}
+// Fail startup if the database is unavailable or its schema cannot be migrated.
+await runSqlFiles(resolve('database/migrations'), 'schema_migrations');
 
 const app = createApp({
   allowedOrigin: env.FRONTEND_ORIGIN,

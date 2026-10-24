@@ -97,12 +97,28 @@ emit `NOT_PLAYED` rather than a fake zero duration.
 
 ## Deployment
 
+To run the API and PostgreSQL together locally:
+
+```bash
+docker compose up --build -d
+docker compose exec api npm run db:seed:prod
+docker compose exec api npm run admin:create:prod -- admin@example.edu StrongPassword123 "Event Admin"
+```
+
+The Compose stack runs schema migrations when the API starts. Override `POSTGRES_DB`,
+`POSTGRES_USER`, `POSTGRES_PASSWORD`, and `FRONTEND_ORIGIN` through the shell or a Compose `.env`
+file when the defaults are unsuitable.
+
+To run only the API image against an existing database:
+
 ```bash
 docker build -t college-fest-hunt-backend .
 docker run --rm --env-file .env -p 3000:3000 college-fest-hunt-backend
 ```
 
-Run `npm run db:migrate:prod` and `npm run db:seed:prod` as release jobs before starting a new image.
+For a standalone container, `DATABASE_URL` must name a database host reachable from inside the
+container; `localhost` points back to the API container. Run `npm run db:seed:prod` as a release
+job before starting a new event.
 The runtime container is non-root. Terminate HTTPS at the platform/load balancer, set the exact
 `FRONTEND_ORIGIN`, use a managed PostgreSQL service with encrypted backups, and alert on readiness,
 5xx rate, latency, connection saturation, and storage growth.
