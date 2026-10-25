@@ -737,6 +737,176 @@ adminRouter.post(
   }),
 );
 
+adminRouter.post(
+  '/admin/events/:eventId/reset',
+  asyncRoute(async (request, response) => {
+    const admin = requireAdmin(request);
+    const eventId = uuid.parse(request.params.eventId);
+    const input = z
+      .object({
+        target: z.enum(['locations', 'teams', 'rounds', 'all']),
+        confirmationText: z.string().trim(),
+      })
+      .parse(request.body);
+
+    const expectedPhrases: Record<string, string[]> = {
+      locations: ['RESET LOCATIONS', 'RESET'],
+      teams: ['RESET TEAMS', 'RESET'],
+      rounds: ['RESET ROUNDS', 'RESET'],
+      all: ['RESET ALL', 'RESET'],
+    };
+    const upperConfirm = input.confirmationText.toUpperCase();
+    if (!expectedPhrases[input.target]?.includes(upperConfirm)) {
+      throw new HttpError(
+        400,
+        'INVALID_CONFIRMATION',
+        `Type "${input.target === 'all' ? 'RESET ALL' : `RESET ${input.target.toUpperCase()}`}" to confirm reset.`,
+      );
+    }
+
+    const result = await withTransaction(async (client) => {
+      const event = await client.query<{ id: string; status: string }>(
+        `SELECT id, status FROM events WHERE id=$1 FOR UPDATE`,
+        [eventId],
+      );
+      if (!event.rows[0]) throw new HttpError(404, 'EVENT_NOT_FOUND', 'Event not found.');
+
+      if (input.target === 'teams' || input.target === 'all') {
+        await client.query(
+          `DELETE FROM sessions s USING participants p
+           WHERE s.participant_id=p.id AND p.event_id=$1`,
+          [eventId],
+        );
+        await client.query(
+          `DELETE FROM game_attempts ga USING teams t
+           WHERE ga.team_id=t.id AND t.event_id=$1`,
+          [eventId],
+        );
+        await client.query(
+          `DELETE FROM game_assignments a USING teams t
+           WHERE a.team_id=t.id AND t.event_id=$1`,
+          [eventId],
+        );
+        await client.query(
+          `DELETE FROM team_round_clues trc USING teams t
+           WHERE trc.team_id=t.id AND t.event_id=$1`,
+          [eventId],
+        );
+        await client.query(
+          `DELETE FROM team_round_locations trl USING teams t
+           WHERE trl.team_id=t.id AND t.event_id=$1`,
+          [eventId],
+        );
+        await client.query(
+          `DELETE FROM team_checkpoint_qrs tcq USING teams t
+           WHERE tcq.team_id=t.id AND t.event_id=$1`,
+          [eventId],
+        );
+        await client.query(
+          `DELETE FROM team_progress tp USING teams t
+           WHERE tp.team_id=t.id AND t.event_id=$1`,
+          [eventId],
+        );
+        await client.query(`DELETE FROM participants WHERE event_id=$1`, [eventId]);
+        await client.query(`DELETE FROM teams WHERE event_id=$1`, [eventId]);
+      }
+
+      if (input.target === 'rounds' || input.target === 'all') {
+        await client.query(
+          `DELETE FROM game_attempts ga USING game_assignments a, rounds r
+           WHERE ga.assignment_id=a.id AND a.round_id=r.id AND r.event_id=$1`,
+          [eventId],
+        );
+        await client.query(
+          `DELETE FROM game_assignments a USING rounds r
+           WHERE a.round_id=r.id AND r.event_id=$1`,
+          [eventId],
+        );
+        await client.query(
+          `DELETE FROM team_round_clues trc USING rounds r
+           WHERE trc.round_id=r.id AND r.event_id=$1`,
+          [eventId],
+        );
+        await client.query(
+          `DELETE FROM team_round_locations trl USING teams t
+           WHERE trl.team_id=t.id AND t.event_id=$1`,
+          [eventId],
+        );
+        await client.query(`DELETE FROM rounds WHERE event_id=$1`, [eventId]);
+        await client.query(
+          `UPDATE team_progress tp
+           SET current_sequence=1, status='NOT_STARTED', started_at=NULL, completed_at=NULL
+           FROM teams t WHERE tp.team_id=t.id AND t.event_id=$1`,
+          [eventId],
+        );
+        await client.query(
+          `UPDATE events SET settings = settings || '{"roundCount": 0, "checkpointCount": 0}'::jsonb WHERE id=$1`,
+          [eventId],
+        );
+      }
+
+      if (input.target === 'locations' || input.target === 'all') {
+        await client.query(
+          `UPDATE rounds SET checkpoint_id=NULL WHERE event_id=$1`,
+          [eventId],
+        );
+        await client.query(
+          `DELETE FROM team_checkpoint_qrs tcq USING checkpoints c
+           WHERE tcq.checkpoint_id=c.id AND c.event_id=$1`,
+          [eventId],
+        );
+        await client.query(
+          `DELETE FROM team_round_locations trl USING checkpoints c
+           WHERE trl.checkpoint_id=c.id AND c.event_id=$1`,
+          [eventId],
+        );
+        await client.query(`DELETE FROM checkpoints WHERE event_id=$1`, [eventId]);
+        await client.query(
+          `UPDATE events SET settings = settings || '{"locationCount": 0}'::jsonb WHERE id=$1`,
+          [eventId],
+        );
+      }
+
+      if (input.target === 'all') {
+        await client.query(`DELETE FROM event_pauses WHERE event_id=$1`, [eventId]);
+        await client.query(
+          `UPDATE events
+           SET status='DRAFT', starts_at=NULL, ends_at=NULL,
+               settings='{"roundCount":0,"locationCount":0,"checkpointCount":0,"retryCooldownSeconds":10,"maxAttempts":5}'::jsonb
+           WHERE id=$1`,
+          [eventId],
+        );
+      } else if (event.rows[0].status !== 'DRAFT') {
+        // If critical structure is reset during running/paused event, revert to draft
+        await client.query(
+          `UPDATE events SET status='DRAFT', starts_at=NULL, ends_at=NULL WHERE id=$1`,
+          [eventId],
+        );
+      }
+
+      return {
+        eventId,
+        target: input.target,
+        deleted: true,
+      };
+    });
+
+    await audit(admin.userId, `RESET_${input.target.toUpperCase()}`, 'event', eventId, eventId, {
+      target: input.target,
+    });
+
+    response.json({
+      data: {
+        ...result,
+        message:
+          input.target === 'all'
+            ? 'The entire hunt has been reset to an initial clean draft.'
+            : `All ${input.target} have been successfully reset.`,
+      },
+    });
+  }),
+);
+
 adminRouter.patch(
   ['/admin/events/:eventId/checkpoint-count', '/admin/events/:eventId/structure'],
   asyncRoute(async (request, response) => {
