@@ -23,7 +23,7 @@ const eventSchema = z.object({
 });
 const teamSchema = z.object({
   eventId: uuid,
-  code: z.string().trim().min(2).max(30),
+  code: z.string().trim().min(2).max(100).optional(),
   name: z.string().trim().min(2).max(100),
 });
 const participantSchema = z.object({
@@ -390,7 +390,7 @@ adminRouter.post(
     const input = z
       .object({
         eventId: uuid,
-        code: z.string().trim().min(2).max(30),
+        code: z.string().trim().min(2).max(100).optional(),
         name: z.string().trim().min(2).max(100),
         members: z
           .array(
@@ -403,6 +403,10 @@ adminRouter.post(
           .max(5),
       })
       .parse(request.body);
+    const teamCode =
+      input.code && input.code.trim().length > 0
+        ? input.code.trim()
+        : input.name.trim().toLowerCase().replace(/\s+/g, '_');
     const credentials = await Promise.all(
       input.members.map(async (member) => {
         const password = `Hunt-${randomInt(100000, 1000000)}!`;
@@ -417,7 +421,7 @@ adminRouter.post(
       const team = await client.query<{ id: string }>(
         `INSERT INTO teams(event_id,code,name)
          SELECT $1,$2,$3 FROM events WHERE id=$1 AND status='DRAFT' RETURNING id`,
-        [input.eventId, input.code, input.name],
+        [input.eventId, teamCode, input.name],
       );
       if (!team.rows[0])
         throw new HttpError(
@@ -1180,13 +1184,17 @@ adminRouter.post(
   asyncRoute(async (request, response) => {
     const admin = requireAdmin(request);
     const input = teamSchema.parse(request.body);
+    const code =
+      input.code && input.code.trim().length > 0
+        ? input.code.trim()
+        : input.name.trim().toLowerCase().replace(/\s+/g, '_');
     const result = await query<{ id: string }>(
       `INSERT INTO teams(event_id,code,name) SELECT $1,$2,$3 WHERE EXISTS (SELECT 1 FROM events WHERE id=$1 AND status='DRAFT') RETURNING id`,
-      [input.eventId, input.code, input.name],
+      [input.eventId, code, input.name],
     );
     if (!result.rows[0])
       throw new HttpError(409, 'EVENT_NOT_EDITABLE', 'Teams can only be added to a draft event.');
-    await audit(admin.userId, 'CREATE', 'team', result.rows[0].id, input.eventId, input);
+    await audit(admin.userId, 'CREATE', 'team', result.rows[0].id, input.eventId, { ...input, code });
     response.status(201).json({ data: result.rows[0] });
   }),
 );
@@ -1216,7 +1224,7 @@ adminRouter.patch(
     const teamId = uuid.parse(request.params.teamId);
     const input = z
       .object({
-        code: z.string().trim().min(2).max(30).optional(),
+        code: z.string().trim().min(2).max(100).optional(),
         name: z.string().trim().min(2).max(100).optional(),
       })
       .refine((value) => value.code !== undefined || value.name !== undefined, {
