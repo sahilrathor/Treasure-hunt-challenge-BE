@@ -120,15 +120,17 @@ authRouter.post(
         if (input.qrToken) {
           scanTokenHash = hashToken(input.qrToken);
           const qr = await client.query(
-            `SELECT q.id FROM team_checkpoint_qrs q JOIN checkpoints c ON c.id=q.checkpoint_id
-             WHERE q.team_id=$1 AND q.qr_token_hash=$2 AND c.active`,
-            [selected.team_id, scanTokenHash],
+            `SELECT c.id FROM checkpoints c
+             WHERE c.active AND (c.qr_token_hash=$1 OR c.qr_token=$2 OR EXISTS (
+               SELECT 1 FROM team_checkpoint_qrs q WHERE q.checkpoint_id=c.id AND q.qr_token_hash=$1
+             ))`,
+            [scanTokenHash, input.qrToken],
           );
           if (!qr.rows[0]) {
             throw new HttpError(
               403,
               'INVALID_TEAM_QR',
-              'This QR code belongs to a different team.',
+              'This QR code is invalid or disabled.',
             );
           }
         }

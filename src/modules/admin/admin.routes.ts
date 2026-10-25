@@ -72,16 +72,21 @@ adminRouter.get(
       slug: string;
       status: string;
       checkpoint_count: number;
+      round_count: number;
+      location_count: number;
     }>(
-      `SELECT id,name,slug,status,COALESCE((settings->>'checkpointCount')::int,8) checkpoint_count
-       FROM events ORDER BY (status='DRAFT') DESC,created_at DESC LIMIT 1`,
+      `SELECT id, name, slug, status,
+              COALESCE((settings->>'roundCount')::int, (settings->>'checkpointCount')::int, (SELECT count(*)::int FROM rounds WHERE event_id=events.id), 5) AS round_count,
+              COALESCE((settings->>'locationCount')::int, (SELECT count(*)::int FROM checkpoints WHERE event_id=events.id AND active), (settings->>'checkpointCount')::int, 5) AS location_count,
+              COALESCE((settings->>'checkpointCount')::int, 8) AS checkpoint_count
+       FROM events ORDER BY (status='DRAFT') DESC, created_at DESC LIMIT 1`,
     );
     const current = event.rows[0];
     if (!current) {
-      response.json({ data: { event: null, teams: [], checkpoints: [] } });
+      response.json({ data: { event: null, teams: [], checkpoints: [], rounds: [] } });
       return;
     }
-    const [teams, checkpoints, activeSessions] = await Promise.all([
+    const [teams, checkpoints, rounds, teamRoundLocations, activeSessions] = await Promise.all([
       query(
         `SELECT t.id, t.code, t.name, tp.status, tp.current_sequence,
          COALESCE(
@@ -112,15 +117,49 @@ adminRouter.get(
          ORDER BY t.code`,
         [current.id],
       ),
-      query(
-        `SELECT c.id, c.label, r.id AS round_id, r.sequence, r.difficulty, r.clue,
-                COALESCE((SELECT jsonb_object_agg(trc.team_id::text, trc.clue)
-                  FROM team_round_clues trc WHERE trc.round_id=r.id), '{}'::jsonb) AS team_clues,
-                r.game_id, g.name AS game_name, g.code AS game_code
+      query<{
+        id: string;
+        code: string;
+        label: string;
+        clue: string;
+        note: string;
+        show_note_to_player: boolean;
+        qr_token: string | null;
+        active: boolean;
+      }>(
+        `SELECT c.id, c.code, c.label, c.clue, c.note, c.show_note_to_player, c.qr_token, c.active
          FROM checkpoints c
-         JOIN rounds r ON r.checkpoint_id=c.id
-         LEFT JOIN games g ON g.id=r.game_id
-         WHERE c.event_id=$1 AND c.active ORDER BY r.sequence`,
+         WHERE c.event_id=$1 AND c.active
+         ORDER BY c.code, c.created_at`,
+        [current.id],
+      ),
+      query<{
+        id: string;
+        sequence: number;
+        difficulty: 'easy' | 'medium' | 'hard';
+        clue: string;
+        checkpoint_id: string | null;
+        game_id: string | null;
+        game_name: string | null;
+        game_code: string | null;
+      }>(
+        `SELECT r.id, r.sequence, r.difficulty, r.clue, r.checkpoint_id,
+                r.game_id, g.name AS game_name, g.code AS game_code
+         FROM rounds r
+         LEFT JOIN games g ON g.id = r.game_id
+         WHERE r.event_id=$1
+         ORDER BY r.sequence`,
+        [current.id],
+      ),
+      query<{
+        team_id: string;
+        round_sequence: number;
+        checkpoint_id: string;
+      }>(
+        `SELECT trl.team_id, trl.round_sequence, trl.checkpoint_id
+         FROM team_round_locations trl
+         JOIN teams t ON t.id = trl.team_id
+         WHERE t.event_id = $1`,
         [current.id],
       ),
       query<{
@@ -144,11 +183,60 @@ adminRouter.get(
         [current.id],
       ),
     ]);
+
+    // Ensure all active checkpoints have a static QR token
+    for (const cp of checkpoints.rows) {
+      if (!cp.qr_token) {
+        const token = createToken(24);
+        await query(
+          `UPDATE checkpoints SET qr_token=$2, qr_token_hash=$3 WHERE id=$1`,
+          [cp.id, token, hashToken(token)],
+        );
+        cp.qr_token = token;
+      }
+    }
+
+    const teamLocationsMap: Record<string, Record<number, string>> = {};
+    for (const trl of teamRoundLocations.rows) {
+      const teamMap = teamLocationsMap[trl.team_id] ?? (teamLocationsMap[trl.team_id] = {});
+      teamMap[trl.round_sequence] = trl.checkpoint_id;
+    }
+
+    const formattedTeams = teams.rows.map((t: any) => ({
+      ...t,
+      roundLocations: teamLocationsMap[t.id] ?? {},
+    }));
+
+    const formattedCheckpoints = checkpoints.rows.map((c, index) => {
+      const matchingRound = rounds.rows.find((r) => r.checkpoint_id === c.id);
+      return {
+        id: c.id,
+        code: c.code,
+        label: c.label,
+        clue: c.clue,
+        note: c.note,
+        show_note_to_player: c.show_note_to_player,
+        qr_token: c.qr_token,
+        scanUrl: c.qr_token
+          ? `${env.FRONTEND_ORIGIN}/scan?token=${encodeURIComponent(c.qr_token)}`
+          : '',
+        active: c.active,
+        sequence: matchingRound?.sequence ?? index + 1,
+        round_id: matchingRound?.id,
+        difficulty: matchingRound?.difficulty ?? 'easy',
+        game_id: matchingRound?.game_id ?? null,
+        game_name: matchingRound?.game_name ?? null,
+        game_code: matchingRound?.game_code ?? null,
+      };
+    });
+
     response.json({
       data: {
         event: current,
-        teams: teams.rows,
-        checkpoints: checkpoints.rows,
+        teams: formattedTeams,
+        checkpoints: formattedCheckpoints,
+        rounds: rounds.rows,
+        teamRoundLocations: teamRoundLocations.rows,
         activeSessions: activeSessions.rows.map((row) => ({
           sessionId: row.session_id,
           loggedInAt: row.logged_in_at,
@@ -168,9 +256,17 @@ adminRouter.post(
   '/admin/simple/setup',
   asyncRoute(async (request, response) => {
     const admin = requireAdmin(request);
-    const { checkpointCount } = z
-      .object({ checkpointCount: z.number().int().min(1).max(8) })
+    const input = z
+      .object({
+        roundCount: z.number().int().min(1).max(16).optional(),
+        locationCount: z.number().int().min(1).max(20).optional(),
+        checkpointCount: z.number().int().min(1).max(20).optional(),
+      })
       .parse(request.body);
+
+    const roundCount = input.roundCount ?? input.checkpointCount ?? 5;
+    const locationCount = input.locationCount ?? input.checkpointCount ?? 5;
+
     const result = await withTransaction(async (client) => {
       const draft = await client.query<{ id: string; slug: string }>(
         `SELECT id,slug FROM events WHERE status='DRAFT' ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
@@ -180,54 +276,108 @@ adminRouter.post(
         const slug = `college-fest-hunt-${Date.now()}`;
         const created = await client.query<{ id: string; slug: string }>(
           `INSERT INTO events(name,slug,settings)
-           VALUES ('College Fest Hunt',$1,jsonb_build_object('checkpointCount',$2::int))
+           VALUES ('College Fest Hunt',$1,jsonb_build_object('roundCount',$2::int,'locationCount',$3::int,'checkpointCount',$2::int))
            RETURNING id,slug`,
-          [slug, checkpointCount],
+          [slug, roundCount, locationCount],
         );
         current = created.rows[0]!;
       } else {
         await client.query(
-          `UPDATE events SET settings=settings || jsonb_build_object('checkpointCount',$2::int) WHERE id=$1`,
-          [current.id, checkpointCount],
+          `UPDATE events SET settings=settings || jsonb_build_object('roundCount',$2::int,'locationCount',$3::int,'checkpointCount',$2::int) WHERE id=$1`,
+          [current.id, roundCount, locationCount],
+        );
+        await client.query(
+          `DELETE FROM team_round_locations WHERE team_id IN (SELECT id FROM teams WHERE event_id=$1)`,
+          [current.id],
         );
         await client.query(`DELETE FROM rounds WHERE event_id=$1`, [current.id]);
         await client.query(`DELETE FROM checkpoints WHERE event_id=$1`, [current.id]);
       }
 
-      const checkpoints: Array<{ id: string; label: string; sequence: number }> = [];
-      for (let sequence = 1; sequence <= checkpointCount; sequence += 1) {
-        const checkpoint = await client.query<{ id: string; label: string }>(
-          `INSERT INTO checkpoints(event_id,code,label,qr_token_hash)
-           VALUES ($1,$2,$3,$4) RETURNING id,label`,
-          [current.id, `CP-${sequence}`, `Checkpoint ${sequence}`, hashToken(createToken(24))],
-        );
-        const difficulty =
-          sequence <= Math.ceil(checkpointCount / 3)
-            ? 'easy'
-            : sequence <= Math.ceil((checkpointCount * 2) / 3)
-              ? 'medium'
-              : 'hard';
-        await client.query(
-          `INSERT INTO rounds(event_id,checkpoint_id,sequence,clue,difficulty)
-           VALUES ($1,$2,$3,$4,$5)`,
+      // 1. Create physical venue locations (checkpoints)
+      const checkpoints: Array<{ id: string; label: string; code: string; sequence: number }> = [];
+      for (let locIdx = 1; locIdx <= locationCount; locIdx += 1) {
+        const token = createToken(24);
+        const checkpoint = await client.query<{ id: string; label: string; code: string }>(
+          `INSERT INTO checkpoints(event_id,code,label,clue,note,show_note_to_player,qr_token,qr_token_hash)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,label,code`,
           [
             current.id,
-            checkpoint.rows[0]!.id,
-            sequence,
-            `Proceed to Checkpoint ${sequence}.`,
-            difficulty,
+            `LOC-${locIdx}`,
+            `Location ${locIdx}`,
+            `Proceed to Location ${locIdx}.`,
+            '',
+            false,
+            token,
+            hashToken(token),
           ],
         );
         checkpoints.push({
           id: checkpoint.rows[0]!.id,
           label: checkpoint.rows[0]!.label,
-          sequence,
+          code: checkpoint.rows[0]!.code,
+          sequence: locIdx,
         });
       }
-      return { eventId: current.id, eventSlug: current.slug, checkpoints };
+
+      // 2. Create competition rounds (independent of location count)
+      const rounds: Array<{ id: string; sequence: number; difficulty: string }> = [];
+      for (let seq = 1; seq <= roundCount; seq += 1) {
+        const difficulty =
+          seq <= Math.ceil(roundCount / 3)
+            ? 'easy'
+            : seq <= Math.ceil((roundCount * 2) / 3)
+              ? 'medium'
+              : 'hard';
+        const defaultCp = checkpoints[(seq - 1) % checkpoints.length]!;
+        const round = await client.query<{ id: string; sequence: number }>(
+          `INSERT INTO rounds(event_id,checkpoint_id,sequence,clue,difficulty)
+           VALUES ($1,$2,$3,$4,$5) RETURNING id,sequence`,
+          [
+            current.id,
+            defaultCp.id,
+            seq,
+            `Proceed to your assigned location for Round ${seq}.`,
+            difficulty,
+          ],
+        );
+        rounds.push({
+          id: round.rows[0]!.id,
+          sequence: seq,
+          difficulty,
+        });
+      }
+
+      // 3. Populate default team round locations if teams exist
+      const existingTeams = await client.query<{ id: string }>(
+        `SELECT id FROM teams WHERE event_id=$1 AND active`,
+        [current.id],
+      );
+      for (const t of existingTeams.rows) {
+        for (let seq = 1; seq <= roundCount; seq += 1) {
+          const defaultCp = checkpoints[(seq - 1) % checkpoints.length]!;
+          await client.query(
+            `INSERT INTO team_round_locations(team_id, round_sequence, checkpoint_id)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (team_id, round_sequence) DO UPDATE SET checkpoint_id = EXCLUDED.checkpoint_id`,
+            [t.id, seq, defaultCp.id],
+          );
+        }
+      }
+
+      return {
+        eventId: current.id,
+        eventSlug: current.slug,
+        roundCount,
+        locationCount,
+        checkpoints,
+        rounds,
+      };
     });
+
     await audit(admin.userId, 'SIMPLE_SETUP', 'event', result.eventId, result.eventId, {
-      checkpointCount,
+      roundCount,
+      locationCount,
     });
     response.status(201).json({ data: result });
   }),
@@ -288,6 +438,28 @@ adminRouter.post(
           ],
         );
       }
+
+      // Automatically assign initial locations for each round sequence
+      const existingCps = await client.query<{ id: string }>(
+        `SELECT id FROM checkpoints WHERE event_id=$1 AND active ORDER BY code, created_at`,
+        [input.eventId],
+      );
+      const existingRounds = await client.query<{ id: string; sequence: number }>(
+        `SELECT id, sequence FROM rounds WHERE event_id=$1 ORDER BY sequence`,
+        [input.eventId],
+      );
+      if (existingCps.rows.length > 0 && existingRounds.rows.length > 0) {
+        for (const r of existingRounds.rows) {
+          const cp = existingCps.rows[(r.sequence - 1) % existingCps.rows.length]!;
+          await client.query(
+            `INSERT INTO team_round_locations(team_id, round_sequence, checkpoint_id)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (team_id, round_sequence) DO NOTHING`,
+            [team.rows[0].id, r.sequence, cp.id],
+          );
+        }
+      }
+
       return team.rows[0].id;
     });
     await audit(admin.userId, 'CREATE', 'team', teamId, input.eventId, {
@@ -436,13 +608,15 @@ adminRouter.post(
         const readiness = await client.query<{
           expected_rounds: number;
           rounds: number;
+          locations: number;
           games: number;
           teams: number;
           invalid_teams: number;
         }>(
           `
-        SELECT COALESCE((SELECT (settings->>'checkpointCount')::int FROM events WHERE id=$1),8) expected_rounds,
+        SELECT COALESCE((SELECT COALESCE((settings->>'roundCount')::int, (settings->>'checkpointCount')::int) FROM events WHERE id=$1), 5) expected_rounds,
           (SELECT count(*)::int FROM rounds WHERE event_id=$1) rounds,
+          (SELECT count(*)::int FROM checkpoints WHERE event_id=$1 AND active) locations,
           (SELECT count(*)::int FROM games WHERE enabled) games,
           (SELECT count(*)::int FROM teams WHERE event_id=$1 AND active) teams,
           (SELECT count(*)::int FROM teams t WHERE t.event_id=$1 AND t.active AND (SELECT count(*) FROM participants p WHERE p.team_id=t.id AND p.active) NOT BETWEEN 3 AND 5) invalid_teams
@@ -452,6 +626,7 @@ adminRouter.post(
         const ready = readiness.rows[0]!;
         if (
           ready.rounds !== ready.expected_rounds ||
+          ready.locations < 1 ||
           ready.games < ready.expected_rounds ||
           ready.teams < 1 ||
           ready.invalid_teams > 0
@@ -459,7 +634,7 @@ adminRouter.post(
           throw new HttpError(
             409,
             'EVENT_NOT_READY',
-            'Finish checkpoint setup and add 3–5 members to every team.',
+            'Finish rounds and location setup, and add 3–5 members to every team.',
             ready,
           );
         await client.query(`UPDATE events SET status='RUNNING',starts_at=now() WHERE id=$1`, [
@@ -535,119 +710,231 @@ adminRouter.post(
 );
 
 adminRouter.patch(
-  '/admin/events/:eventId/checkpoint-count',
+  ['/admin/events/:eventId/checkpoint-count', '/admin/events/:eventId/structure'],
   asyncRoute(async (request, response) => {
     const admin = requireAdmin(request);
     const eventId = uuid.parse(request.params.eventId);
-    const { checkpointCount } = z
-      .object({ checkpointCount: z.number().int().min(1).max(8) })
+    const input = z
+      .object({
+        roundCount: z.number().int().min(1).max(16).optional(),
+        locationCount: z.number().int().min(1).max(20).optional(),
+        checkpointCount: z.number().int().min(1).max(20).optional(),
+      })
       .parse(request.body);
 
     const result = await withTransaction(async (client) => {
       const event = await client.query<{
         status: string;
-        checkpoint_count: number;
-        actual_checkpoint_count: number;
+        round_count: number;
+        location_count: number;
       }>(
-        `SELECT status,COALESCE((settings->>'checkpointCount')::int,8) checkpoint_count,
-           (SELECT count(*)::int FROM rounds WHERE event_id=$1) actual_checkpoint_count
+        `SELECT status,
+           COALESCE((settings->>'roundCount')::int, (settings->>'checkpointCount')::int, (SELECT count(*)::int FROM rounds WHERE event_id=$1), 5) AS round_count,
+           COALESCE((settings->>'locationCount')::int, (SELECT count(*)::int FROM checkpoints WHERE event_id=$1 AND active), (settings->>'checkpointCount')::int, 5) AS location_count
          FROM events WHERE id=$1 FOR UPDATE`,
         [eventId],
       );
       if (!event.rows[0]) throw new HttpError(404, 'EVENT_NOT_FOUND', 'Event not found.');
       if (event.rows[0].status === 'FINISHED') {
-        throw new HttpError(409, 'EVENT_FINISHED', 'Checkpoints cannot be changed after the hunt ends.');
-      }
-      const previousCount = event.rows[0].actual_checkpoint_count;
-      if (checkpointCount === previousCount) {
-        return { previousCount, checkpoints: [] };
+        throw new HttpError(409, 'EVENT_FINISHED', 'Hunt configuration cannot be changed after the hunt ends.');
       }
 
-      if (checkpointCount < previousCount) {
+      const prevRoundCount = event.rows[0].round_count;
+      const prevLocCount = event.rows[0].location_count;
+
+      const targetRoundCount =
+        input.roundCount ?? (input.checkpointCount !== undefined ? input.checkpointCount : prevRoundCount);
+      const targetLocCount =
+        input.locationCount ??
+        (input.checkpointCount !== undefined && input.roundCount === undefined
+          ? input.checkpointCount
+          : prevLocCount);
+
+      // 1. Handle locationCount changes
+      const allExistingCps = await client.query<{ id: string; code: string }>(
+        `SELECT id, code FROM checkpoints WHERE event_id=$1 AND active ORDER BY code, created_at`,
+        [eventId],
+      );
+      const currentLocCount = allExistingCps.rows.length;
+
+      if (targetLocCount < currentLocCount) {
+        const toRemove = allExistingCps.rows.slice(targetLocCount);
+        const removedIds = toRemove.map((c) => c.id);
+
+        const inUse = await client.query<{ code: string }>(
+          `SELECT t.code FROM teams t
+           JOIN team_progress tp ON tp.team_id=t.id
+           JOIN team_round_locations trl ON trl.team_id=t.id AND trl.round_sequence=tp.current_sequence
+           WHERE t.event_id=$1 AND t.active AND trl.checkpoint_id=ANY($2::uuid[])
+           LIMIT 1`,
+          [eventId, removedIds],
+        );
+        if (inUse.rows[0]) {
+          throw new HttpError(
+            409,
+            'LOCATIONS_IN_USE',
+            `Cannot reduce locations because team ${inUse.rows[0].code} is currently assigned to a removed location.`,
+          );
+        }
+
+        await client.query(`DELETE FROM checkpoints WHERE id=ANY($1::uuid[])`, [removedIds]);
+
+        const firstCp = allExistingCps.rows[0];
+        if (firstCp) {
+          await client.query(
+            `UPDATE team_round_locations SET checkpoint_id=$2 WHERE checkpoint_id=ANY($1::uuid[])`,
+            [removedIds, firstCp.id],
+          );
+        } else {
+          await client.query(`DELETE FROM team_round_locations WHERE checkpoint_id=ANY($1::uuid[])`, [
+            removedIds,
+          ]);
+        }
+      } else if (targetLocCount > currentLocCount) {
+        for (let locIdx = currentLocCount + 1; locIdx <= targetLocCount; locIdx += 1) {
+          const token = createToken(24);
+          await client.query(
+            `INSERT INTO checkpoints(event_id,code,label,clue,note,show_note_to_player,qr_token,qr_token_hash)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [
+              eventId,
+              `LOC-${locIdx}`,
+              `Location ${locIdx}`,
+              `Proceed to Location ${locIdx}.`,
+              '',
+              false,
+              token,
+              hashToken(token),
+            ],
+          );
+        }
+      }
+
+      // 2. Handle roundCount changes
+      if (targetRoundCount < prevRoundCount) {
         const blocked = await client.query<{ code: string }>(
           `SELECT t.code FROM teams t JOIN team_progress tp ON tp.team_id=t.id
            WHERE t.event_id=$1 AND t.active
              AND (tp.status='COMPLETED' OR tp.current_sequence>$2)
            ORDER BY t.code LIMIT 1`,
-          [eventId, checkpointCount],
+          [eventId, targetRoundCount],
         );
         if (blocked.rows[0]) {
           throw new HttpError(
             409,
-            'CHECKPOINTS_IN_USE',
-            `Checkpoint count cannot be reduced because team ${blocked.rows[0].code} has already progressed beyond it.`,
+            'ROUNDS_IN_USE',
+            `Round count cannot be reduced because team ${blocked.rows[0].code} has already progressed beyond it.`,
           );
         }
 
         const assigned = await client.query<{ id: string }>(
           `SELECT a.id FROM game_assignments a JOIN rounds r ON r.id=a.round_id
            WHERE r.event_id=$1 AND r.sequence>$2 LIMIT 1`,
-          [eventId, checkpointCount],
+          [eventId, targetRoundCount],
         );
         if (assigned.rows[0]) {
           throw new HttpError(
             409,
-            'CHECKPOINTS_IN_USE',
-            'Checkpoint count cannot be reduced because a removed checkpoint already has game activity.',
+            'ROUNDS_IN_USE',
+            'Round count cannot be reduced because a removed round already has game activity.',
           );
         }
 
-        const removed = await client.query<{ checkpoint_id: string }>(
-          `DELETE FROM rounds WHERE event_id=$1 AND sequence>$2 RETURNING checkpoint_id`,
-          [eventId, checkpointCount],
+        await client.query(`DELETE FROM rounds WHERE event_id=$1 AND sequence>$2`, [
+          eventId,
+          targetRoundCount,
+        ]);
+        await client.query(
+          `DELETE FROM team_round_locations trl USING teams t
+           WHERE trl.team_id = t.id AND t.event_id = $1 AND trl.round_sequence > $2`,
+          [eventId, targetRoundCount],
         );
-        if (removed.rows.length) {
-          await client.query(`DELETE FROM checkpoints WHERE id=ANY($1::uuid[])`, [
-            removed.rows.map((row) => row.checkpoint_id),
-          ]);
-        }
-      }
-
-      const checkpoints: Array<{ id: string; label: string; sequence: number }> = [];
-      if (checkpointCount > previousCount) {
-        for (let sequence = previousCount + 1; sequence <= checkpointCount; sequence += 1) {
-          const checkpoint = await client.query<{ id: string; label: string }>(
-            `INSERT INTO checkpoints(event_id,code,label,qr_token_hash)
-             VALUES ($1,$2,$3,$4) RETURNING id,label`,
-            [eventId, `CP-${sequence}`, `Checkpoint ${sequence}`, hashToken(createToken(24))],
-          );
+      } else if (targetRoundCount > prevRoundCount) {
+        const availableCps = await client.query<{ id: string }>(
+          `SELECT id FROM checkpoints WHERE event_id=$1 AND active ORDER BY code, created_at`,
+          [eventId],
+        );
+        for (let seq = prevRoundCount + 1; seq <= targetRoundCount; seq += 1) {
           const difficulty =
-            sequence <= Math.ceil(checkpointCount / 3)
+            seq <= Math.ceil(targetRoundCount / 3)
               ? 'easy'
-              : sequence <= Math.ceil((checkpointCount * 2) / 3)
+              : seq <= Math.ceil((targetRoundCount * 2) / 3)
                 ? 'medium'
                 : 'hard';
+          const defaultCpId = availableCps.rows.length
+            ? availableCps.rows[(seq - 1) % availableCps.rows.length]!.id
+            : null;
           await client.query(
             `INSERT INTO rounds(event_id,checkpoint_id,sequence,clue,difficulty)
              VALUES ($1,$2,$3,$4,$5)`,
             [
               eventId,
-              checkpoint.rows[0]!.id,
-              sequence,
-              `Proceed to Checkpoint ${sequence}.`,
+              defaultCpId,
+              seq,
+              `Proceed to your assigned location for Round ${seq}.`,
               difficulty,
             ],
           );
-          checkpoints.push({
-            id: checkpoint.rows[0]!.id,
-            label: checkpoint.rows[0]!.label,
-            sequence,
-          });
+        }
+
+        // Auto-seed team_round_locations for existing teams for new sequences
+        const existingTeams = await client.query<{ id: string }>(
+          `SELECT id FROM teams WHERE event_id=$1 AND active`,
+          [eventId],
+        );
+        if (availableCps.rows.length > 0) {
+          for (const t of existingTeams.rows) {
+            for (let seq = prevRoundCount + 1; seq <= targetRoundCount; seq += 1) {
+              const cp = availableCps.rows[(seq - 1) % availableCps.rows.length]!;
+              await client.query(
+                `INSERT INTO team_round_locations(team_id, round_sequence, checkpoint_id)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (team_id, round_sequence) DO NOTHING`,
+                [t.id, seq, cp.id],
+              );
+            }
+          }
         }
       }
 
       await client.query(
-        `UPDATE events SET settings=settings || jsonb_build_object('checkpointCount',$2::int) WHERE id=$1`,
-        [eventId, checkpointCount],
+        `UPDATE events
+         SET settings = settings || jsonb_build_object(
+           'roundCount', $2::int,
+           'locationCount', $3::int,
+           'checkpointCount', $2::int
+         )
+         WHERE id=$1`,
+        [eventId, targetRoundCount, targetLocCount],
       );
-      return { previousCount, checkpoints };
+
+      const allCps = await client.query<{ id: string; label: string; code: string }>(
+        `SELECT id, label, code FROM checkpoints WHERE event_id=$1 AND active ORDER BY code, created_at`,
+        [eventId],
+      );
+
+      return {
+        prevRoundCount,
+        prevLocCount,
+        roundCount: targetRoundCount,
+        locationCount: targetLocCount,
+        checkpointCount: targetRoundCount,
+        checkpoints: allCps.rows,
+      };
     });
 
-    await audit(admin.userId, 'CHANGE_CHECKPOINT_COUNT', 'event', eventId, eventId, {
-      previousCount: result.previousCount,
-      checkpointCount,
+    await audit(admin.userId, 'CHANGE_HUNT_STRUCTURE', 'event', eventId, eventId, {
+      roundCount: result.roundCount,
+      locationCount: result.locationCount,
     });
-    response.json({ data: { checkpointCount, checkpoints: result.checkpoints } });
+    response.json({
+      data: {
+        roundCount: result.roundCount,
+        locationCount: result.locationCount,
+        checkpointCount: result.checkpointCount,
+        checkpoints: result.checkpoints,
+      },
+    });
   }),
 );
 
@@ -859,7 +1146,8 @@ adminRouter.get(
           '[]'::json
         ) AS attempts
       FROM rounds r
-      JOIN checkpoints c ON c.id = r.checkpoint_id
+      LEFT JOIN team_round_locations trl ON trl.team_id = $1 AND trl.round_sequence = r.sequence
+      LEFT JOIN checkpoints c ON c.id = COALESCE(trl.checkpoint_id, r.checkpoint_id)
       LEFT JOIN game_assignments a ON a.team_id = $1 AND a.round_id = r.id
       LEFT JOIN games g ON g.id = a.game_id
       LEFT JOIN game_attempts x ON x.assignment_id = a.id
@@ -1087,76 +1375,149 @@ adminRouter.patch(
     const checkpointId = uuid.parse(request.params.checkpointId);
     const input = z
       .object({
-        label: z.string().min(2).max(120).optional(),
+        label: z.string().trim().min(1).max(120).optional(),
+        clue: z.string().trim().max(2000).optional(),
+        note: z.string().trim().max(5000).optional(),
+        showNoteToPlayer: z.boolean().optional(),
         active: z.boolean().optional(),
         rotateToken: z.boolean().optional(),
         teamId: uuid.optional(),
-        clue: z.string().trim().min(1).max(1000).optional(),
         difficulty: z.enum(['easy', 'medium', 'hard']).optional(),
       })
       .parse(request.body);
-    if (input.rotateToken && !input.teamId) {
-      throw new HttpError(400, 'TEAM_REQUIRED', 'Choose a team before generating a QR code.');
-    }
+
     const token = input.rotateToken ? createToken(24) : null;
-    const result = await query<{ event_id: string }>(
+    const result = await query<{
+      event_id: string;
+      code: string;
+      label: string;
+      clue: string;
+      note: string;
+      show_note_to_player: boolean;
+      qr_token: string;
+    }>(
       `UPDATE checkpoints c
-       SET label=COALESCE($2,c.label),active=COALESCE($3,c.active)
+       SET label=COALESCE($2,c.label),
+           clue=COALESCE($3,c.clue),
+           note=COALESCE($4,c.note),
+           show_note_to_player=COALESCE($5,c.show_note_to_player),
+           active=COALESCE($6,c.active),
+           qr_token=CASE WHEN $7::boolean THEN $8 ELSE c.qr_token END,
+           qr_token_hash=CASE WHEN $7::boolean THEN $9 ELSE c.qr_token_hash END
        FROM events e WHERE c.id=$1 AND e.id=c.event_id AND e.status<>'FINISHED'
-       RETURNING c.event_id`,
-      [checkpointId, input.label ?? null, input.active ?? null],
+       RETURNING c.event_id, c.code, c.label, c.clue, c.note, c.show_note_to_player, c.qr_token`,
+      [
+        checkpointId,
+        input.label ?? null,
+        input.clue ?? null,
+        input.note ?? null,
+        input.showNoteToPlayer ?? null,
+        input.active ?? null,
+        Boolean(token),
+        token,
+        token ? hashToken(token) : null,
+      ],
     );
     if (!result.rows[0])
       throw new HttpError(
         409,
         'CHECKPOINT_NOT_EDITABLE',
-        'QR codes and checkpoints cannot be changed after the hunt is finished.',
+        'Locations and checkpoints cannot be changed after the hunt is finished.',
       );
+
+    const updated = result.rows[0];
 
     if (input.clue !== undefined) {
       await query(
         `UPDATE rounds SET clue=$2 WHERE checkpoint_id=$1 AND event_id=$3`,
-        [checkpointId, input.clue, result.rows[0].event_id],
+        [checkpointId, input.clue, updated.event_id],
       );
     }
 
     if (input.difficulty !== undefined) {
       await query(
         `UPDATE rounds SET difficulty=$2 WHERE checkpoint_id=$1 AND event_id=$3`,
-        [checkpointId, input.difficulty, result.rows[0].event_id],
+        [checkpointId, input.difficulty, updated.event_id],
       );
     }
 
     if (token && input.teamId) {
-      const qr = await query(
+      await query(
         `INSERT INTO team_checkpoint_qrs(team_id,checkpoint_id,qr_token_hash)
          SELECT t.id,c.id,$3 FROM teams t JOIN checkpoints c ON c.event_id=t.event_id
          JOIN events e ON e.id=t.event_id
          WHERE t.id=$1 AND c.id=$2 AND t.active AND e.status<>'FINISHED'
          ON CONFLICT(team_id,checkpoint_id) DO UPDATE
-         SET qr_token_hash=EXCLUDED.qr_token_hash,updated_at=now()
-         RETURNING id`,
+         SET qr_token_hash=EXCLUDED.qr_token_hash,updated_at=now()`,
         [input.teamId, checkpointId, hashToken(token)],
       );
-      if (!qr.rows[0]) {
-        throw new HttpError(404, 'TEAM_NOT_FOUND', 'The selected team is unavailable.');
-      }
     }
 
-    await audit(admin.userId, 'UPDATE', 'checkpoint', checkpointId, result.rows[0].event_id, input);
+    await audit(admin.userId, 'UPDATE', 'checkpoint', checkpointId, updated.event_id, input);
     response.json({
       data: {
         id: checkpointId,
-        ...(token
-          ? {
-              qrToken: token,
-              scanUrl: `${env.FRONTEND_ORIGIN}/scan?token=${encodeURIComponent(token)}`,
-              teamId: input.teamId,
-            }
-          : {}),
-        ...(input.clue !== undefined ? { clue: input.clue } : {}),
+        code: updated.code,
+        label: updated.label,
+        clue: updated.clue,
+        note: updated.note,
+        showNoteToPlayer: updated.show_note_to_player,
+        qrToken: updated.qr_token,
+        scanUrl: updated.qr_token
+          ? `${env.FRONTEND_ORIGIN}/scan?token=${encodeURIComponent(updated.qr_token)}`
+          : '',
+        ...(input.difficulty !== undefined ? { difficulty: input.difficulty } : {}),
       },
     });
+  }),
+);
+
+adminRouter.post(
+  '/admin/events/:eventId/team-round-locations',
+  asyncRoute(async (request, response) => {
+    const admin = requireAdmin(request);
+    const eventId = uuid.parse(request.params.eventId);
+    const input = z
+      .object({
+        mappings: z
+          .array(
+            z.object({
+              teamId: uuid,
+              roundSequence: z.number().int().min(1).max(16),
+              checkpointId: uuid,
+            }),
+          )
+          .min(1),
+      })
+      .parse(request.body);
+
+    await withTransaction(async (client) => {
+      const event = await client.query<{ id: string; status: string }>(
+        `SELECT id, status FROM events WHERE id=$1`,
+        [eventId],
+      );
+      if (!event.rows[0]) throw new HttpError(404, 'EVENT_NOT_FOUND', 'Event not found.');
+      if (event.rows[0].status === 'FINISHED')
+        throw new HttpError(409, 'EVENT_FINISHED', 'Cannot modify routes for a finished event.');
+
+      for (const item of input.mappings) {
+        await client.query(
+          `INSERT INTO team_round_locations(team_id, round_sequence, checkpoint_id, updated_at)
+           SELECT t.id, $2, c.id, now()
+           FROM teams t, checkpoints c
+           WHERE t.id = $1 AND t.event_id = $4 AND t.active
+             AND c.id = $3 AND c.event_id = $4 AND c.active
+           ON CONFLICT (team_id, round_sequence)
+           DO UPDATE SET checkpoint_id = EXCLUDED.checkpoint_id, updated_at = now()`,
+          [item.teamId, item.roundSequence, item.checkpointId, eventId],
+        );
+      }
+    });
+
+    await audit(admin.userId, 'UPDATE_TEAM_ROUND_LOCATIONS', 'event', eventId, eventId, {
+      count: input.mappings.length,
+    });
+    response.json({ data: { updated: true, count: input.mappings.length } });
   }),
 );
 

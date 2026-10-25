@@ -41,7 +41,16 @@ describe('team-specific clues', () => {
     vi.mocked(db.query)
       .mockResolvedValueOnce(result([participantSession]))
       .mockResolvedValueOnce(
-        result([{ status: 'IN_PROGRESS', current_sequence: 2, sequence: 2, clue: 'Team 1 clue' }]),
+        result([
+          {
+            status: 'IN_PROGRESS',
+            current_sequence: 2,
+            sequence: 2,
+            clue: 'Team 1 clue',
+            note: null,
+            checkpoint_label: null,
+          },
+        ]),
       );
 
     const response = await request(app)
@@ -50,13 +59,13 @@ describe('team-specific clues', () => {
 
     expect(response.status).toBe(200);
     expect(response.body).toEqual({
-      data: { status: 'IN_PROGRESS', round: 2, clue: 'Team 1 clue' },
+      data: { status: 'IN_PROGRESS', round: 2, clue: 'Team 1 clue', note: null, locationLabel: null },
     });
     expect(db.query).toHaveBeenLastCalledWith(
-      expect.stringContaining('COALESCE(trc.clue,r.clue)'),
+      expect.stringContaining('COALESCE(NULLIF(c.clue, \'\'), trc.clue, r.clue, \'\')'),
       ['team-1', 'event-1'],
     );
-    expect(db.query).toHaveBeenLastCalledWith(expect.stringContaining('trc.team_id=tp.team_id'), [
+    expect(db.query).toHaveBeenLastCalledWith(expect.stringContaining('trc.team_id = tp.team_id'), [
       'team-1',
       'event-1',
     ]);

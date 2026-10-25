@@ -63,9 +63,11 @@ const assignmentSelect = `
   SELECT a.id, a.team_id, a.round_id, a.game_id, g.enabled AS game_enabled, r.game_id AS round_mapped_game_id,
     a.status, g.code AS game_code, g.name AS game_name, COALESCE(g.description, '') AS game_description, r.difficulty, l.config,
     a.public_challenge, a.secret_challenge, l.max_attempts, l.cooldown_seconds,
-    r.sequence AS round_sequence, c.label AS checkpoint_label
+    r.sequence AS round_sequence, COALESCE(c.label, 'Checkpoint') AS checkpoint_label
   FROM game_assignments a JOIN games g ON g.id=a.game_id JOIN game_levels l ON l.id=a.game_level_id
-  JOIN rounds r ON r.id=a.round_id JOIN checkpoints c ON c.id=r.checkpoint_id
+  JOIN rounds r ON r.id=a.round_id
+  LEFT JOIN team_round_locations trl ON trl.team_id=a.team_id AND trl.round_sequence=r.sequence
+  LEFT JOIN checkpoints c ON c.id=COALESCE(trl.checkpoint_id, r.checkpoint_id)
 `;
 
 async function selectGameForRound(
@@ -194,11 +196,19 @@ huntRouter.get(
     const participant = requireParticipant(request);
     const result = await query(
       `SELECT tp.status,tp.current_sequence,tp.started_at,tp.completed_at,
+    COALESCE((e.settings->>'roundCount')::int, (e.settings->>'checkpointCount')::int, (SELECT count(*)::int FROM rounds WHERE event_id=e.id), 8) AS total_rounds,
     a.id AS assignment_id,a.status AS assignment_status,g.code AS game_code,g.name AS game_name,r.difficulty,
     (SELECT count(*)::int FROM game_attempts x WHERE x.assignment_id=a.id AND x.status<>'cancelled') AS attempt_count,
     l.max_attempts,l.cooldown_seconds,
-    (SELECT max(ended_at) FROM game_attempts x WHERE x.assignment_id=a.id AND x.status IN ('failed','expired')) AS last_failed_at
-    FROM team_progress tp LEFT JOIN rounds r ON r.event_id=$2 AND r.sequence=tp.current_sequence
+    (SELECT max(ended_at) FROM game_attempts x WHERE x.assignment_id=a.id AND x.status IN ('failed','expired')) AS last_failed_at,
+    COALESCE(c.label, 'Location') AS checkpoint_label,
+    COALESCE(NULLIF(c.clue, ''), r.clue, '') AS checkpoint_clue,
+    CASE WHEN c.show_note_to_player AND c.note IS NOT NULL AND c.note <> '' THEN c.note ELSE NULL END AS checkpoint_note
+    FROM team_progress tp
+    JOIN events e ON e.id=$2
+    LEFT JOIN rounds r ON r.event_id=$2 AND r.sequence=tp.current_sequence
+    LEFT JOIN team_round_locations trl ON trl.team_id=tp.team_id AND trl.round_sequence=tp.current_sequence
+    LEFT JOIN checkpoints c ON c.id=COALESCE(trl.checkpoint_id, r.checkpoint_id)
     LEFT JOIN game_assignments a ON a.team_id=tp.team_id AND a.round_id=r.id
     LEFT JOIN games g ON g.id=a.game_id LEFT JOIN game_levels l ON l.id=a.game_level_id WHERE tp.team_id=$1`,
       [participant.teamId, participant.eventId],
@@ -249,14 +259,16 @@ huntRouter.post(
     const participant = requireParticipant(request);
     const { token } = z.object({ token: z.string().min(16).max(200) }).parse(request.body);
     const tokenHash = hashToken(token);
-    if (participant.scanTokenHash !== tokenHash) {
-      throw new HttpError(
-        401,
-        'SCAN_LOGIN_REQUIRED',
-        'Log in after scanning this QR code to continue.',
-      );
+    if (participant.scanTokenHash) {
+      if (participant.scanTokenHash !== tokenHash) {
+        throw new HttpError(
+          401,
+          'SCAN_LOGIN_REQUIRED',
+          'Log in after scanning this QR code to continue.',
+        );
+      }
+      await query(`UPDATE sessions SET scan_token_hash=NULL WHERE id=$1`, [participant.sessionId]);
     }
-    await query(`UPDATE sessions SET scan_token_hash=NULL WHERE id=$1`, [participant.sessionId]);
     const result = await withTransaction(async (client) => {
       const progress = await client.query<{
         current_sequence: number;
@@ -274,31 +286,62 @@ huntRouter.post(
         throw new HttpError(409, 'HUNT_NOT_ACTIVE', 'Start the hunt before scanning.');
       if (state.event_status !== 'RUNNING')
         throw new HttpError(409, 'EVENT_NOT_RUNNING', 'The event is paused or finished.');
+
+      // 1. Identify which location was scanned
+      const scanned = await client.query<{
+        id: string;
+        label: string;
+        code: string;
+        active: boolean;
+      }>(
+        `SELECT c.id, c.label, c.code, c.active
+         FROM checkpoints c
+         WHERE c.event_id = $1
+           AND (c.qr_token_hash = $2 OR c.qr_token = $3 OR EXISTS (
+             SELECT 1 FROM team_checkpoint_qrs q WHERE q.checkpoint_id = c.id AND q.qr_token_hash = $2
+           ))`,
+        [participant.eventId, tokenHash, token],
+      );
+      const scannedCp = scanned.rows[0];
+      if (!scannedCp || !scannedCp.active) {
+        throw new HttpError(404, 'INVALID_QR', 'This checkpoint QR is invalid or disabled.');
+      }
+
+      // 2. Identify current round
       const round = await client.query<{
         id: string;
         sequence: number;
         difficulty: Difficulty;
-        checkpoint_label: string;
         game_id: string | null;
+        checkpoint_id: string | null;
       }>(
-        `
-      SELECT r.id,r.sequence,r.difficulty,c.label checkpoint_label,r.game_id
-      FROM team_checkpoint_qrs q
-      JOIN checkpoints c ON c.id=q.checkpoint_id
-      JOIN rounds r ON r.checkpoint_id=c.id
-      WHERE c.event_id=$1 AND q.team_id=$2 AND q.qr_token_hash=$3 AND c.active
-    `,
-        [participant.eventId, participant.teamId, tokenHash],
+        `SELECT r.id, r.sequence, r.difficulty, r.game_id, r.checkpoint_id
+         FROM rounds r
+         WHERE r.event_id = $1 AND r.sequence = $2`,
+        [participant.eventId, state.current_sequence],
       );
       const currentRound = round.rows[0];
-      if (!currentRound)
-        throw new HttpError(404, 'INVALID_QR', 'This checkpoint QR is invalid or disabled.');
-      if (currentRound.sequence !== state.current_sequence)
+      if (!currentRound) {
+        throw new HttpError(404, 'ROUND_NOT_CONFIGURED', 'Round is not configured.');
+      }
+
+      // 3. Find the assigned location for this team in this round
+      const assigned = await client.query<{ checkpoint_id: string }>(
+        `SELECT trl.checkpoint_id
+         FROM team_round_locations trl
+         WHERE trl.team_id = $1 AND trl.round_sequence = $2`,
+        [participant.teamId, state.current_sequence],
+      );
+      const expectedCheckpointId = assigned.rows[0]?.checkpoint_id ?? currentRound.checkpoint_id;
+
+      if (!expectedCheckpointId || expectedCheckpointId !== scannedCp.id) {
         throw new HttpError(
           409,
           'CHECKPOINT_NOT_CURRENT',
-          'This checkpoint is not available for your current round.',
+          `This QR code is for ${scannedCp.label}, which is not your assigned location for Round ${state.current_sequence}. Check your current clue!`,
         );
+      }
+
       const existing = await client.query<AssignmentRow>(
         `${assignmentSelect} WHERE a.team_id=$1 AND a.round_id=$2`,
         [participant.teamId, currentRound.id],
@@ -395,7 +438,7 @@ huntRouter.post(
           public_challenge: challenge.publicData,
           secret_challenge: challenge.secretData,
           round_sequence: currentRound.sequence,
-          checkpoint_label: currentRound.checkpoint_label,
+          checkpoint_label: scannedCp.label,
         },
         0,
       );
@@ -675,7 +718,7 @@ huntRouter.post(
         `
       SELECT a.id,a.status,g.code game_code,g.name game_name,r.difficulty,l.config,a.public_challenge,a.secret_challenge,l.max_attempts,l.cooldown_seconds,r.sequence round_sequence,c.label checkpoint_label,
         x.id attempt_id,x.status attempt_status,x.started_at,x.participant_id,x.team_id,x.result_metadata,x.submit_idempotency_key,x.duration_ms,
-        COALESCE((e.settings->>'checkpointCount')::int,8) checkpoint_count
+        COALESCE((e.settings->>'roundCount')::int, (e.settings->>'checkpointCount')::int, 8) checkpoint_count
       FROM game_attempts x JOIN game_assignments a ON a.id=x.assignment_id JOIN games g ON g.id=a.game_id JOIN game_levels l ON l.id=a.game_level_id JOIN rounds r ON r.id=a.round_id JOIN checkpoints c ON c.id=r.checkpoint_id JOIN teams t ON t.id=x.team_id JOIN events e ON e.id=t.event_id
       WHERE x.id=$1 FOR UPDATE OF x,a
     `,
@@ -763,12 +806,23 @@ huntRouter.get(
   '/teams/me/clue',
   asyncRoute(async (request, response) => {
     const participant = requireParticipant(request);
-    const result = await query(
-      `SELECT tp.status,tp.current_sequence,COALESCE(trc.clue,r.clue) AS clue,r.sequence
+    const result = await query<{
+      status: string;
+      current_sequence: number;
+      clue: string | null;
+      note: string | null;
+      checkpoint_label: string | null;
+    }>(
+      `SELECT tp.status, tp.current_sequence,
+              COALESCE(NULLIF(c.clue, ''), trc.clue, r.clue, '') AS clue,
+              CASE WHEN c.show_note_to_player AND c.note IS NOT NULL AND c.note <> '' THEN c.note ELSE NULL END AS note,
+              c.label AS checkpoint_label
        FROM team_progress tp
-       LEFT JOIN rounds r ON r.event_id=$2 AND r.sequence=tp.current_sequence
-       LEFT JOIN team_round_clues trc ON trc.team_id=tp.team_id AND trc.round_id=r.id
-       WHERE tp.team_id=$1`,
+       LEFT JOIN rounds r ON r.event_id = $2 AND r.sequence = tp.current_sequence
+       LEFT JOIN team_round_locations trl ON trl.team_id = tp.team_id AND trl.round_sequence = tp.current_sequence
+       LEFT JOIN checkpoints c ON c.id = COALESCE(trl.checkpoint_id, r.checkpoint_id)
+       LEFT JOIN team_round_clues trc ON trc.team_id = tp.team_id AND trc.round_id = r.id
+       WHERE tp.team_id = $1`,
       [participant.teamId, participant.eventId],
     );
     const row = result.rows[0];
@@ -778,8 +832,14 @@ huntRouter.get(
     response.json({
       data:
         row.status === 'COMPLETED'
-          ? { status: 'COMPLETED', clue: null }
-          : { status: row.status, round: row.sequence, clue: row.clue },
+          ? { status: 'COMPLETED', clue: null, note: null, locationLabel: null }
+          : {
+              status: row.status,
+              round: row.current_sequence,
+              clue: row.clue,
+              note: row.note,
+              locationLabel: row.checkpoint_label,
+            },
     });
   }),
 );
