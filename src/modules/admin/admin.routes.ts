@@ -74,12 +74,14 @@ adminRouter.get(
       checkpoint_count: number;
       round_count: number;
       location_count: number;
+      allow_multiple_logins: boolean;
     }>(
       `SELECT id, name, slug, status,
+              COALESCE((settings->>'allowMultipleLogins')::boolean, false) AS allow_multiple_logins,
               COALESCE((settings->>'roundCount')::int, (settings->>'checkpointCount')::int, (SELECT count(*)::int FROM rounds WHERE event_id=events.id), 5) AS round_count,
               COALESCE((settings->>'locationCount')::int, (SELECT count(*)::int FROM checkpoints WHERE event_id=events.id AND active), (settings->>'checkpointCount')::int, 5) AS location_count,
               COALESCE((settings->>'checkpointCount')::int, 8) AS checkpoint_count
-       FROM events ORDER BY (status='DRAFT') DESC, created_at DESC LIMIT 1`,
+       FROM events ORDER BY (status='DRAFT') DESC, (status='RUNNING') DESC, created_at DESC LIMIT 1`,
     );
     const current = event.rows[0];
     if (!current) {
@@ -523,6 +525,40 @@ adminRouter.post(
   }),
 );
 
+adminRouter.patch(
+  '/admin/simple/login-policy',
+  asyncRoute(async (request, response) => {
+    const admin = requireAdmin(request);
+    const input = z
+      .object({
+        allowMultipleLogins: z.boolean(),
+      })
+      .parse(request.body);
+
+    const event = await query<{ id: string }>(
+      `SELECT id FROM events ORDER BY (status='DRAFT') DESC, (status='RUNNING') DESC, created_at DESC LIMIT 1`,
+    );
+    if (!event.rows[0]) {
+      throw new HttpError(404, 'EVENT_NOT_FOUND', 'No active event found.');
+    }
+    const eventId = event.rows[0].id;
+    const result = await query<{ id: string; settings: Record<string, unknown> }>(
+      `UPDATE events
+       SET settings = settings || jsonb_build_object('allowMultipleLogins', $2::boolean)
+       WHERE id=$1
+       RETURNING id, settings`,
+      [eventId, input.allowMultipleLogins],
+    );
+    await audit(admin.userId, 'UPDATE_LOGIN_POLICY', 'event', eventId, eventId, input);
+    response.json({
+      data: {
+        eventId,
+        allowMultipleLogins: Boolean(result.rows[0].settings.allowMultipleLogins),
+      },
+    });
+  }),
+);
+
 adminRouter.post(
   '/admin/events/:eventId/new-hunt',
   asyncRoute(async (request, response) => {
@@ -672,6 +708,12 @@ adminRouter.post(
         await client.query(`UPDATE events SET status='RUNNING',starts_at=now() WHERE id=$1`, [
           eventId,
         ]);
+        await client.query(
+          `UPDATE team_progress tp
+           SET status='IN_PROGRESS',started_at=COALESCE(tp.started_at, now()),updated_at=now()
+           FROM teams t WHERE tp.team_id=t.id AND t.event_id=$1 AND tp.status='NOT_STARTED'`,
+          [eventId],
+        );
       } else if (action === 'PAUSE') {
         if (event.rows[0].status !== 'RUNNING')
           throw new HttpError(409, 'INVALID_EVENT_STATE', 'Only a running event can pause.');

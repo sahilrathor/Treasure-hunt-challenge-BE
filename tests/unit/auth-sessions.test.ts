@@ -169,4 +169,69 @@ describe('auth sessions and teammate login takeover', () => {
       [participantId],
     );
   });
+
+  it('allows multiple players from the same team to log in when allowMultipleLogins is true', async () => {
+    vi.mocked(db.query)
+      .mockResolvedValueOnce(result([]))
+      .mockResolvedValueOnce(
+        result([
+          {
+            id: participantId,
+            team_id: teamId,
+            password_hash: 'hash-123',
+            settings: { allowMultipleLogins: true },
+          },
+        ]),
+      );
+
+    const client = {
+      query: vi
+        .fn()
+        // Lock team
+        .mockResolvedValueOnce(result([{ id: teamId }]))
+        // Revoke current user prior sessions
+        .mockResolvedValueOnce(result([]))
+        // Insert new session
+        .mockResolvedValueOnce(result([])),
+    };
+
+    vi.mocked(tx.withTransaction).mockImplementationOnce(async (callback) =>
+      callback(client as never),
+    );
+
+    const response = await request(app)
+      .post('/api/v1/auth/login')
+      .send({ identifier: 'TEAM-1', password: 'SecretPassword123!' });
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.authenticated).toBe(true);
+    // Verify it did NOT check or revoke other teammates
+    expect(client.query).not.toHaveBeenCalledWith(
+      expect.stringContaining('UPDATE sessions SET revoked_at=now() FROM participants p'),
+      expect.anything(),
+    );
+  });
+
+  it('allows admin to toggle allowMultipleLogins via PATCH /api/v1/admin/simple/login-policy', async () => {
+    vi.mocked(db.query)
+      .mockResolvedValueOnce(result([adminSession]))
+      // SELECT event
+      .mockResolvedValueOnce(result([{ id: 'event-1' }]))
+      // UPDATE event settings
+      .mockResolvedValueOnce(result([{ id: 'event-1', settings: { allowMultipleLogins: true } }]))
+      // audit
+      .mockResolvedValueOnce(result([]));
+
+    const response = await request(app)
+      .patch('/api/v1/admin/simple/login-policy')
+      .set('Authorization', 'Bearer admin-token')
+      .send({ allowMultipleLogins: true });
+
+    expect(response.status).toBe(200);
+    expect(response.body.data).toEqual({
+      eventId: 'event-1',
+      allowMultipleLogins: true,
+    });
+  });
 });
+

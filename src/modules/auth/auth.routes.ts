@@ -55,9 +55,14 @@ authRouter.post(
     if (admin.rows[0] && (await argon2.verify(admin.rows[0].password_hash, input.password))) {
       token = await createSession({ adminId: admin.rows[0].id });
     } else {
-      const participant = await query<{ id: string; team_id: string; password_hash: string }>(
+      const participant = await query<{
+        id: string;
+        team_id: string;
+        password_hash: string;
+        settings?: Record<string, unknown>;
+      }>(
         `
-      SELECT p.id, p.team_id, p.password_hash FROM participants p JOIN events e ON e.id = p.event_id
+      SELECT p.id, p.team_id, p.password_hash, e.settings FROM participants p JOIN events e ON e.id = p.event_id
       WHERE p.member_code = $1 AND p.active AND e.status IN ('RUNNING','PAUSED','DRAFT')
       ORDER BY CASE e.status WHEN 'RUNNING' THEN 1 WHEN 'PAUSED' THEN 2 ELSE 3 END,e.created_at DESC
       LIMIT 1
@@ -73,43 +78,47 @@ authRouter.post(
       const selected = participant.rows[0];
       token = await withTransaction(async (client) => {
         await client.query(`SELECT id FROM teams WHERE id=$1 FOR UPDATE`, [selected.team_id]);
-        const active = await client.query<{
-          participant_id: string;
-          display_name: string;
-          member_code: string;
-          created_at: string;
-        }>(
-          `SELECT s.participant_id, p.display_name, p.member_code, s.created_at
-           FROM sessions s JOIN participants p ON p.id=s.participant_id
-           WHERE p.team_id=$1 AND s.revoked_at IS NULL AND s.expires_at>now()
-           ORDER BY (s.participant_id<>$2) DESC, s.created_at DESC LIMIT 1`,
-          [selected.team_id, selected.id],
-        );
-        if (active.rows[0] && active.rows[0].participant_id !== selected.id) {
-          if (!input.force) {
-            throw new HttpError(
-              409,
-              'TEAM_ALREADY_LOGGED_IN',
-              'Another player from your team is already logged in.',
-              {
-                activePlayer: {
-                  participantId: active.rows[0].participant_id,
-                  displayName: active.rows[0].display_name,
-                  memberCode: active.rows[0].member_code,
-                  loggedInAt: active.rows[0].created_at,
+        const allowMultipleLogins = Boolean(selected.settings?.allowMultipleLogins);
+
+        if (!allowMultipleLogins) {
+          const active = await client.query<{
+            participant_id: string;
+            display_name: string;
+            member_code: string;
+            created_at: string;
+          }>(
+            `SELECT s.participant_id, p.display_name, p.member_code, s.created_at
+             FROM sessions s JOIN participants p ON p.id=s.participant_id
+             WHERE p.team_id=$1 AND s.revoked_at IS NULL AND s.expires_at>now()
+             ORDER BY (s.participant_id<>$2) DESC, s.created_at DESC LIMIT 1`,
+            [selected.team_id, selected.id],
+          );
+          if (active.rows[0] && active.rows[0].participant_id !== selected.id) {
+            if (!input.force) {
+              throw new HttpError(
+                409,
+                'TEAM_ALREADY_LOGGED_IN',
+                'Another player from your team is already logged in.',
+                {
+                  activePlayer: {
+                    participantId: active.rows[0].participant_id,
+                    displayName: active.rows[0].display_name,
+                    memberCode: active.rows[0].member_code,
+                    loggedInAt: active.rows[0].created_at,
+                  },
                 },
-              },
+              );
+            }
+            await client.query(
+              `UPDATE sessions SET revoked_at=now()
+               FROM participants p
+               WHERE sessions.participant_id=p.id
+                 AND p.team_id=$1
+                 AND sessions.revoked_at IS NULL
+                 AND sessions.expires_at>now()`,
+              [selected.team_id],
             );
           }
-          await client.query(
-            `UPDATE sessions SET revoked_at=now()
-             FROM participants p
-             WHERE sessions.participant_id=p.id
-               AND p.team_id=$1
-               AND sessions.revoked_at IS NULL
-               AND sessions.expires_at>now()`,
-            [selected.team_id],
-          );
         }
         await client.query(
           `UPDATE sessions SET revoked_at=now()

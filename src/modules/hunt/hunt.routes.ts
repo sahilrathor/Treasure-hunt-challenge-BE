@@ -194,6 +194,13 @@ huntRouter.get(
   '/teams/me/progress',
   asyncRoute(async (request, response) => {
     const participant = requireParticipant(request);
+    await query(
+      `UPDATE team_progress tp
+       SET status='IN_PROGRESS',started_at=COALESCE(tp.started_at, now()),updated_at=now()
+       FROM teams t JOIN events e ON e.id=t.event_id
+       WHERE tp.team_id=$1 AND tp.team_id=t.id AND e.id=$2 AND e.status='RUNNING' AND tp.status='NOT_STARTED'`,
+      [participant.teamId, participant.eventId],
+    );
     const result = await query(
       `SELECT tp.status,tp.current_sequence,tp.started_at,tp.completed_at,
     COALESCE((e.settings->>'roundCount')::int, (e.settings->>'checkpointCount')::int, (SELECT count(*)::int FROM rounds WHERE event_id=e.id), 8) AS total_rounds,
@@ -282,10 +289,19 @@ huntRouter.post(
         [participant.teamId],
       );
       const state = progress.rows[0];
-      if (!state || state.progress_status !== 'IN_PROGRESS')
-        throw new HttpError(409, 'HUNT_NOT_ACTIVE', 'Start the hunt before scanning.');
+      if (!state) throw new HttpError(404, 'TEAM_NOT_FOUND', 'Team not found.');
       if (state.event_status !== 'RUNNING')
         throw new HttpError(409, 'EVENT_NOT_RUNNING', 'The event is paused or finished.');
+
+      if (state.progress_status === 'NOT_STARTED') {
+        await client.query(
+          `UPDATE team_progress SET status='IN_PROGRESS',started_at=now(),updated_at=now() WHERE team_id=$1`,
+          [participant.teamId],
+        );
+        state.progress_status = 'IN_PROGRESS';
+      } else if (state.progress_status !== 'IN_PROGRESS') {
+        throw new HttpError(409, 'HUNT_NOT_ACTIVE', 'Your team has already finished or is not active.');
+      }
 
       // 1. Identify which location was scanned
       const scanned = await client.query<{
@@ -831,16 +847,19 @@ huntRouter.get(
     const participant = requireParticipant(request);
     const result = await query<{
       status: string;
+      event_status: string;
       current_sequence: number;
       clue: string | null;
       note: string | null;
       checkpoint_label: string | null;
     }>(
-      `SELECT tp.status, tp.current_sequence,
+      `SELECT tp.status, e.status AS event_status, tp.current_sequence,
               COALESCE(NULLIF(c.clue, ''), trc.clue, r.clue, '') AS clue,
               CASE WHEN c.show_note_to_player AND c.note IS NOT NULL AND c.note <> '' THEN c.note ELSE NULL END AS note,
               c.label AS checkpoint_label
        FROM team_progress tp
+       JOIN teams t ON t.id = tp.team_id
+       JOIN events e ON e.id = t.event_id
        LEFT JOIN rounds r ON r.event_id = $2 AND r.sequence = tp.current_sequence
        LEFT JOIN team_round_locations trl ON trl.team_id = tp.team_id AND trl.round_sequence = tp.current_sequence
        LEFT JOIN checkpoints c ON c.id = COALESCE(trl.checkpoint_id, r.checkpoint_id)
@@ -850,14 +869,22 @@ huntRouter.get(
     );
     const row = result.rows[0];
     if (!row) throw new HttpError(404, 'PROGRESS_NOT_FOUND', 'Progress not found.');
-    if (row.status === 'NOT_STARTED')
+    let currentStatus = row.status;
+    if (currentStatus === 'NOT_STARTED' && row.event_status === 'RUNNING') {
+      await query(
+        `UPDATE team_progress SET status='IN_PROGRESS',started_at=COALESCE(started_at, now()),updated_at=now() WHERE team_id=$1`,
+        [participant.teamId],
+      );
+      currentStatus = 'IN_PROGRESS';
+    } else if (currentStatus === 'NOT_STARTED') {
       throw new HttpError(409, 'HUNT_NOT_STARTED', 'Start the hunt to unlock the first clue.');
+    }
     response.json({
       data:
-        row.status === 'COMPLETED'
+        currentStatus === 'COMPLETED'
           ? { status: 'COMPLETED', clue: null, note: null, locationLabel: null }
           : {
-              status: row.status,
+              status: currentStatus,
               round: row.current_sequence,
               clue: row.clue,
               note: row.note,
