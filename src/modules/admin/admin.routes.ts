@@ -624,18 +624,46 @@ adminRouter.post(
           [eventId],
         );
         const ready = readiness.rows[0]!;
-        if (
-          ready.rounds !== ready.expected_rounds ||
-          ready.locations < 1 ||
-          ready.games < ready.expected_rounds ||
-          ready.teams < 1 ||
-          ready.invalid_teams > 0
-        )
+        const reasons: string[] = [];
+        if (ready.rounds !== ready.expected_rounds) {
+          reasons.push(
+            `Hunt settings expect ${ready.expected_rounds} rounds, but found ${ready.rounds} rounds configured. Please click "Update Structure" or adjust rounds.`,
+          );
+        }
+        if (ready.locations < 1) {
+          reasons.push('At least 1 active checkpoint/location is required.');
+        }
+        if (ready.games < ready.expected_rounds) {
+          reasons.push(
+            `At least ${ready.expected_rounds} enabled games are required (currently ${ready.games} enabled).`,
+          );
+        }
+        if (ready.teams < 1) {
+          reasons.push('At least 1 active team is required before starting the hunt.');
+        }
+        if (ready.invalid_teams > 0) {
+          const invalidTeamRows = await client.query<{ name: string; member_count: number }>(
+            `SELECT t.name, count(p.id)::int as member_count
+             FROM teams t
+             LEFT JOIN participants p ON p.team_id=t.id AND p.active
+             WHERE t.event_id=$1 AND t.active
+             GROUP BY t.id, t.name
+             HAVING count(p.id) NOT BETWEEN 3 AND 5`,
+            [eventId],
+          );
+          const details = invalidTeamRows.rows
+            .map((r) => `"${r.name}" (${r.member_count} member${r.member_count === 1 ? '' : 's'})`)
+            .join(', ');
+          reasons.push(
+            `Every team must have between 3 and 5 members. Invalid team(s): ${details}.`,
+          );
+        }
+        if (reasons.length > 0)
           throw new HttpError(
             409,
             'EVENT_NOT_READY',
-            'Finish rounds and location setup, and add 3–5 members to every team.',
-            ready,
+            reasons.join(' '),
+            { ...ready, reasons },
           );
         await client.query(`UPDATE events SET status='RUNNING',starts_at=now() WHERE id=$1`, [
           eventId,
