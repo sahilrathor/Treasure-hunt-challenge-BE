@@ -700,7 +700,13 @@ huntRouter.post(
     const participant = requireParticipant(request);
     const attemptId = uuid.parse(request.params.attemptId);
     const key = idempotencyKey.parse(request.headers['idempotency-key']);
-    const submission = z.object({ result: z.unknown() }).parse(request.body);
+    const submission = z
+      .object({
+        result: z.unknown(),
+        clientDurationMs: z.number().int().nonnegative().optional(),
+        completedAt: z.string().optional(),
+      })
+      .parse(request.body);
     const outcome = await withTransaction(async (client) => {
       const found = await client.query<
         AssignmentRow & {
@@ -740,9 +746,26 @@ huntRouter.post(
           metadata: row.result_metadata,
           clueUnlocked: row.attempt_status === 'passed',
         };
-      const durationMs = Math.max(0, Date.now() - new Date(row.started_at).getTime());
+      const serverElapsedMs = Math.max(0, Date.now() - new Date(row.started_at).getTime());
       const configuredLimit =
         typeof row.config.timeLimitSeconds === 'number' ? row.config.timeLimitSeconds : 300;
+
+      // Handle offline completions: when a player completes offline and reconnects later,
+      // respect the client-measured duration so offline wait time does not inflate game duration or trigger false expiry.
+      let durationMs = serverElapsedMs;
+      if (
+        typeof submission.clientDurationMs === 'number' &&
+        submission.clientDurationMs >= 0 &&
+        submission.clientDurationMs <= serverElapsedMs + 5000
+      ) {
+        durationMs = Math.min(submission.clientDurationMs, serverElapsedMs);
+      }
+
+      const endedAt =
+        submission.completedAt && !isNaN(new Date(submission.completedAt).getTime())
+          ? new Date(submission.completedAt)
+          : new Date(new Date(row.started_at).getTime() + durationMs);
+
       let status: 'passed' | 'failed' | 'expired';
       let metadata: Record<string, unknown>;
       if (durationMs > configuredLimit * 1000) {
@@ -759,14 +782,14 @@ huntRouter.post(
         metadata = validated.metadata;
       }
       await client.query(
-        `UPDATE game_attempts SET status=$2,ended_at=now(),duration_ms=$3,result_metadata=$4,submit_idempotency_key=$5 WHERE id=$1`,
-        [attemptId, status, durationMs, metadata, key],
+        `UPDATE game_attempts SET status=$2,ended_at=$3,duration_ms=$4,result_metadata=$5,submit_idempotency_key=$6 WHERE id=$1`,
+        [attemptId, status, endedAt, durationMs, metadata, key],
       );
       let clueUnlocked = false;
       if (status === 'passed' && row.status === 'ASSIGNED') {
         await client.query(
-          `UPDATE game_assignments SET status='PASSED',passed_at=now() WHERE id=$1`,
-          [row.id],
+          `UPDATE game_assignments SET status='PASSED',passed_at=$2 WHERE id=$1`,
+          [row.id, endedAt],
         );
         const progress = await client.query<{ current_sequence: number }>(
           `SELECT current_sequence FROM team_progress WHERE team_id=$1 FOR UPDATE`,
