@@ -56,13 +56,18 @@ export function createApp(options: AppOptions = {}) {
   );
   app.use(express.json({ limit: '32kb' }));
   app.use(
-    rateLimit({ windowMs: 60_000, limit: 180, standardHeaders: 'draft-8', legacyHeaders: false }),
+    rateLimit({
+      windowMs: 60_000,
+      limit: isDev ? 5_000 : 2_000,
+      standardHeaders: 'draft-8',
+      legacyHeaders: false,
+    }),
   );
   app.use(
     '/api/v1/auth/login',
     rateLimit({
       windowMs: 15 * 60_000,
-      limit: 10,
+      limit: isDev ? 1_000 : 500,
       standardHeaders: 'draft-8',
       legacyHeaders: false,
     }),
