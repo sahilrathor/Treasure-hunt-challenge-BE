@@ -89,7 +89,21 @@ adminRouter.get(
       return;
     }
     const [teams, checkpoints, rounds, teamRoundLocations, activeSessions] = await Promise.all([
-      query(
+      query<{
+        id: string;
+        code: string;
+        name: string;
+        status: string;
+        current_sequence: number;
+        participants: Array<{
+          id: string;
+          memberCode: string;
+          displayName: string;
+          isLoggedIn: boolean;
+          loggedInAt: string | null;
+          sessionId: string | null;
+        }>;
+      }>(
         `SELECT t.id, t.code, t.name, tp.status, tp.current_sequence,
          COALESCE(
            jsonb_agg(
@@ -204,7 +218,7 @@ adminRouter.get(
       teamMap[trl.round_sequence] = trl.checkpoint_id;
     }
 
-    const formattedTeams = teams.rows.map((t: any) => ({
+    const formattedTeams = teams.rows.map((t) => ({
       ...t,
       roundLocations: teamLocationsMap[t.id] ?? {},
     }));
