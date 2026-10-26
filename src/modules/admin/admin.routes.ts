@@ -549,11 +549,15 @@ adminRouter.patch(
        RETURNING id, settings`,
       [eventId, input.allowMultipleLogins],
     );
+    const updatedEvent = result.rows[0];
+    if (!updatedEvent) {
+      throw new HttpError(404, 'EVENT_NOT_FOUND', 'Event not found.');
+    }
     await audit(admin.userId, 'UPDATE_LOGIN_POLICY', 'event', eventId, eventId, input);
     response.json({
       data: {
         eventId,
-        allowMultipleLogins: Boolean(result.rows[0].settings.allowMultipleLogins),
+        allowMultipleLogins: Boolean(updatedEvent.settings.allowMultipleLogins),
       },
     });
   }),
