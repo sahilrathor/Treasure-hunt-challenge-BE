@@ -654,7 +654,7 @@ adminRouter.post(
         reason: z.string().max(500).optional(),
       })
       .parse(request.body);
-    const reset = await withTransaction(async (client) => {
+    const controlResult = await withTransaction(async (client) => {
       const event = await client.query<{ status: string }>(
         `SELECT status FROM events WHERE id=$1 FOR UPDATE`,
         [eventId],
@@ -723,7 +723,7 @@ adminRouter.post(
             reasons.join(' '),
             { ...ready, reasons },
           );
-        await client.query(`UPDATE events SET status='RUNNING',starts_at=now() WHERE id=$1`, [
+        await client.query(`UPDATE events SET status='RUNNING',starts_at=COALESCE(starts_at,now()) WHERE id=$1`, [
           eventId,
         ]);
         await client.query(
@@ -760,44 +760,20 @@ adminRouter.post(
         ]);
       } else {
         if (event.rows[0].status !== 'FINISHED')
-          throw new HttpError(409, 'INVALID_EVENT_STATE', 'Only a finished hunt can restart.');
+          throw new HttpError(409, 'INVALID_EVENT_STATE', 'Only a finished hunt can be reopened.');
 
-        const attempts = await client.query(
-          `DELETE FROM game_attempts ga USING teams t
-           WHERE ga.team_id=t.id AND t.event_id=$1`,
-          [eventId],
-        );
-        const assignments = await client.query(
-          `DELETE FROM game_assignments a USING teams t
-           WHERE a.team_id=t.id AND t.event_id=$1`,
-          [eventId],
-        );
-        const teams = await client.query(
-          `UPDATE team_progress tp
-           SET current_sequence=1,status='NOT_STARTED',started_at=NULL,completed_at=NULL,updated_at=now()
-           FROM teams t WHERE tp.team_id=t.id AND t.event_id=$1`,
-          [eventId],
-        );
-        await client.query(`DELETE FROM event_pauses WHERE event_id=$1`, [eventId]);
+        // Reopening is non-destructive: attempts, assignments, team progress,
+        // pause history, and participant sessions remain available.
         await client.query(
-          `UPDATE sessions s SET revoked_at=now() FROM participants p
-           WHERE s.participant_id=p.id AND p.event_id=$1 AND s.revoked_at IS NULL`,
+          `UPDATE events SET status='DRAFT' WHERE id=$1`,
           [eventId],
         );
-        await client.query(
-          `UPDATE events SET status='DRAFT',starts_at=NULL,ends_at=NULL WHERE id=$1`,
-          [eventId],
-        );
-        return {
-          attempts: attempts.rowCount ?? 0,
-          assignments: assignments.rowCount ?? 0,
-          teams: teams.rowCount ?? 0,
-        };
+        return { preserved: true };
       }
       return null;
     });
-    await audit(admin.userId, action, 'event', eventId, eventId, { reason, reset });
-    response.json({ data: { eventId, action, reset } });
+    await audit(admin.userId, action, 'event', eventId, eventId, { reason, result: controlResult });
+    response.json({ data: { eventId, action, result: controlResult } });
   }),
 );
 
