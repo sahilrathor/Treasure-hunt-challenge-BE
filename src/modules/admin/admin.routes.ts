@@ -1844,6 +1844,159 @@ adminRouter.patch(
 );
 
 adminRouter.post(
+  '/admin/events/:eventId/team-round-games',
+  asyncRoute(async (request, response) => {
+    const admin = requireAdmin(request);
+    const eventId = uuid.parse(request.params.eventId);
+    const input = z
+      .object({
+        teamId: uuid,
+        mappings: z
+          .array(
+            z.object({
+              roundId: uuid,
+              gameId: uuid.nullable().optional(),
+            }),
+          )
+          .min(1),
+      })
+      .parse(request.body);
+
+    await withTransaction(async (client) => {
+      const event = await client.query<{ id: string; status: string }>(
+        `SELECT id, status FROM events WHERE id=$1`,
+        [eventId],
+      );
+      if (!event.rows[0]) throw new HttpError(404, 'EVENT_NOT_FOUND', 'Event not found.');
+      if (event.rows[0].status === 'FINISHED') {
+        throw new HttpError(409, 'EVENT_FINISHED', 'Cannot modify team game mappings for a finished event.');
+      }
+
+      const team = await client.query(
+        `SELECT id FROM teams WHERE id=$1 AND event_id=$2 AND active`,
+        [input.teamId, eventId],
+      );
+      if (!team.rows[0]) throw new HttpError(404, 'TEAM_NOT_FOUND', 'Team not found in this event.');
+
+      const explicitGames = input.mappings
+        .filter((mapping) => mapping.gameId)
+        .map((mapping) => mapping.gameId as string);
+      if (new Set(explicitGames).size !== explicitGames.length) {
+        throw new HttpError(409, 'DUPLICATE_TEAM_GAME', 'A team cannot be assigned the same game in multiple rounds.');
+      }
+
+      for (const mapping of input.mappings) {
+        const round = await client.query<{ id: string; difficulty: string }>(
+          `SELECT id, difficulty FROM rounds WHERE id=$1 AND event_id=$2`,
+          [mapping.roundId, eventId],
+        );
+        if (!round.rows[0]) {
+          throw new HttpError(404, 'ROUND_NOT_FOUND', 'One of the selected rounds does not belong to this event.');
+        }
+
+        if (mapping.gameId) {
+          const available = await client.query(
+            `SELECT 1 FROM games g
+             JOIN game_levels l ON l.game_id=g.id AND l.enabled AND l.difficulty=$2
+             WHERE g.id=$1 AND g.enabled`,
+            [mapping.gameId, round.rows[0].difficulty],
+          );
+          if (!available.rows[0]) {
+            throw new HttpError(
+              409,
+              'TEAM_GAME_UNAVAILABLE',
+              `The selected game is not enabled for Round ${round.rows[0].difficulty} difficulty.`,
+            );
+          }
+
+          const duplicate = await client.query(
+            `SELECT 1 FROM game_assignments WHERE team_id=$1 AND game_id=$2 AND round_id<>$3
+             UNION ALL
+             SELECT 1 FROM rounds r WHERE r.event_id=$4 AND r.id<>$3 AND r.game_id=$2
+               AND NOT EXISTS (
+                 SELECT 1 FROM team_round_game_mappings m
+                 WHERE m.team_id=$1 AND m.round_id=r.id
+               )
+             LIMIT 1`,
+            [input.teamId, mapping.gameId, mapping.roundId, eventId],
+          );
+          if (duplicate.rows[0]) {
+            throw new HttpError(
+              409,
+              'TEAM_GAME_ALREADY_USED',
+              'That game is already assigned or played by this team in another round.',
+            );
+          }
+        }
+
+        const existingMapping = await client.query<{ game_id: string | null }>(
+          `SELECT game_id FROM team_round_game_mappings WHERE team_id=$1 AND round_id=$2`,
+          [input.teamId, mapping.roundId],
+        );
+        const assignment = await client.query<{ game_id: string }>(
+          `SELECT game_id FROM game_assignments WHERE team_id=$1 AND round_id=$2`,
+          [input.teamId, mapping.roundId],
+        );
+        const mappingUnchanged =
+          mapping.gameId === undefined
+            ? !existingMapping.rows[0]
+            : existingMapping.rows[0]?.game_id === mapping.gameId;
+        if (
+          assignment.rows[0] &&
+          !mappingUnchanged &&
+          mapping.gameId !== assignment.rows[0].game_id
+        ) {
+          throw new HttpError(
+            409,
+            'ROUND_GAME_ALREADY_ASSIGNED',
+            'This team already has a game assignment for that round. Reset the assignment before changing it.',
+          );
+        }
+
+        if (mapping.gameId === undefined) {
+          await client.query(
+            `DELETE FROM team_round_game_mappings WHERE team_id=$1 AND round_id=$2`,
+            [input.teamId, mapping.roundId],
+          );
+        } else {
+          await client.query(
+            `INSERT INTO team_round_game_mappings(team_id, round_id, game_id, updated_at)
+             VALUES ($1,$2,$3,now())
+             ON CONFLICT (team_id, round_id)
+             DO UPDATE SET game_id=EXCLUDED.game_id, updated_at=now()`,
+            [input.teamId, mapping.roundId, mapping.gameId],
+          );
+        }
+      }
+    });
+
+    await audit(admin.userId, 'MAP_TEAM_ROUND_GAMES', 'team', input.teamId, eventId, {
+      count: input.mappings.length,
+    });
+    response.json({ data: { updated: true, count: input.mappings.length } });
+  }),
+);
+
+adminRouter.get(
+  '/admin/events/:eventId/team-round-games',
+  asyncRoute(async (request, response) => {
+    requireAdmin(request);
+    const eventId = uuid.parse(request.params.eventId);
+    const teamId = uuid.parse(request.query.teamId);
+    const result = await query(
+      `SELECT m.round_id, r.sequence, m.game_id
+       FROM team_round_game_mappings m
+       JOIN rounds r ON r.id=m.round_id
+       JOIN teams t ON t.id=m.team_id
+       WHERE t.event_id=$1 AND t.id=$2
+       ORDER BY r.sequence`,
+      [eventId, teamId],
+    );
+    response.json({ data: result.rows });
+  }),
+);
+
+adminRouter.post(
   '/admin/events/:eventId/round-games',
   asyncRoute(async (request, response) => {
     const admin = requireAdmin(request);

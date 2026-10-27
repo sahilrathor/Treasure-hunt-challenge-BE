@@ -23,6 +23,7 @@ interface AssignmentRow {
   game_id: string;
   game_enabled: boolean;
   round_mapped_game_id: string | null;
+  team_game_override: boolean;
   status: string;
   game_code: string;
   game_name: string;
@@ -60,13 +61,16 @@ function assignmentResponse(
 }
 
 const assignmentSelect = `
-  SELECT a.id, a.team_id, a.round_id, a.game_id, g.enabled AS game_enabled, r.game_id AS round_mapped_game_id,
+  SELECT a.id, a.team_id, a.round_id, a.game_id, g.enabled AS game_enabled,
+    CASE WHEN trg.team_id IS NULL THEN r.game_id ELSE trg.game_id END AS round_mapped_game_id,
+    (trg.team_id IS NOT NULL) AS team_game_override,
     a.status, g.code AS game_code, g.name AS game_name, COALESCE(g.description, '') AS game_description, r.difficulty, l.config,
     a.public_challenge, a.secret_challenge, l.max_attempts, l.cooldown_seconds,
     r.sequence AS round_sequence, COALESCE(c.label, 'Checkpoint') AS checkpoint_label
   FROM game_assignments a JOIN games g ON g.id=a.game_id JOIN game_levels l ON l.id=a.game_level_id
   JOIN rounds r ON r.id=a.round_id
   LEFT JOIN team_round_locations trl ON trl.team_id=a.team_id AND trl.round_sequence=r.sequence
+  LEFT JOIN team_round_game_mappings trg ON trg.team_id=a.team_id AND trg.round_id=r.id
   LEFT JOIN checkpoints c ON c.id=COALESCE(trl.checkpoint_id, r.checkpoint_id)
 `;
 
@@ -76,6 +80,7 @@ async function selectGameForRound(
   difficulty: Difficulty,
   roundMappedGameId: string | null | undefined,
   excludeRoundId?: string,
+  strictMappedGame = false,
 ) {
   let selected: {
     game_id: string;
@@ -106,6 +111,7 @@ async function selectGameForRound(
           SELECT 1 FROM game_assignments a
           WHERE a.team_id=$1 AND a.game_id=g.id ${excludeRoundId ? 'AND a.round_id <> $4' : ''}
         )
+        ${excludeRoundId ? 'AND NOT EXISTS (SELECT 1 FROM team_round_game_mappings m WHERE m.team_id=$1 AND m.game_id=g.id AND m.round_id<>$4)' : ''}
     `,
       excludeRoundId
         ? [teamId, difficulty, roundMappedGameId, excludeRoundId]
@@ -113,6 +119,12 @@ async function selectGameForRound(
     );
     if (mapped.rows[0]) {
       selected = mapped.rows[0];
+    } else if (strictMappedGame) {
+      throw new HttpError(
+        409,
+        'TEAM_GAME_UNAVAILABLE',
+        'The game selected for this team and round is unavailable or was already used by this team.',
+      );
     }
   }
 
@@ -136,6 +148,7 @@ async function selectGameForRound(
           SELECT 1 FROM game_assignments a
           WHERE a.team_id=$1 AND a.game_id=g.id ${excludeRoundId ? 'AND a.round_id <> $3' : ''}
         )
+        ${excludeRoundId ? 'AND NOT EXISTS (SELECT 1 FROM team_round_game_mappings m WHERE m.team_id=$1 AND m.game_id=g.id AND m.round_id<>$3)' : ''}
     `,
       excludeRoundId ? [teamId, difficulty, excludeRoundId] : [teamId, difficulty],
     );
@@ -329,12 +342,17 @@ huntRouter.post(
         sequence: number;
         difficulty: Difficulty;
         game_id: string | null;
+        team_game_override: boolean;
         checkpoint_id: string | null;
       }>(
-        `SELECT r.id, r.sequence, r.difficulty, r.game_id, r.checkpoint_id
+        `SELECT r.id, r.sequence, r.difficulty,
+                CASE WHEN trg.team_id IS NULL THEN r.game_id ELSE trg.game_id END AS game_id,
+                (trg.team_id IS NOT NULL) AS team_game_override,
+                r.checkpoint_id
          FROM rounds r
-         WHERE r.event_id = $1 AND r.sequence = $2`,
-        [participant.eventId, state.current_sequence],
+         LEFT JOIN team_round_game_mappings trg ON trg.team_id=$1 AND trg.round_id=r.id
+         WHERE r.event_id = $3 AND r.sequence = $2`,
+        [participant.teamId, state.current_sequence, participant.eventId],
       );
       const currentRound = round.rows[0];
       if (!currentRound) {
@@ -376,6 +394,7 @@ huntRouter.post(
             currentRound.difficulty,
             currentRound.game_id,
             currentRound.id,
+            currentRound.team_game_override,
           );
 
           await client.query(
@@ -429,6 +448,8 @@ huntRouter.post(
         participant.teamId,
         currentRound.difficulty,
         currentRound.game_id,
+        currentRound.id,
+        currentRound.team_game_override,
       );
 
       const inserted = await client.query<{ id: string; status: string }>(
@@ -486,9 +507,19 @@ huntRouter.get(
     const isGameUnavailable = !row.game_enabled || !gameRegistry.has(row.game_code);
     if (row.status !== 'PASSED' && isGameUnavailable) {
       await withTransaction(async (client) => {
-        const roundResult = await client.query<{ id: string; difficulty: Difficulty; game_id: string | null }>(
-          `SELECT id, difficulty, game_id FROM rounds WHERE id=$1`,
-          [row.round_id],
+        const roundResult = await client.query<{
+          id: string;
+          difficulty: Difficulty;
+          game_id: string | null;
+          team_game_override: boolean;
+        }>(
+          `SELECT r.id, r.difficulty,
+                  CASE WHEN trg.team_id IS NULL THEN r.game_id ELSE trg.game_id END AS game_id,
+                  (trg.team_id IS NOT NULL) AS team_game_override
+           FROM rounds r
+           LEFT JOIN team_round_game_mappings trg ON trg.team_id=$2 AND trg.round_id=r.id
+           WHERE r.id=$1`,
+          [row.round_id, participant.teamId],
         );
         if (roundResult.rows[0]) {
           const { selected, challenge } = await selectGameForRound(
@@ -497,6 +528,7 @@ huntRouter.get(
             roundResult.rows[0].difficulty,
             roundResult.rows[0].game_id,
             row.round_id,
+            roundResult.rows[0].team_game_override,
           );
           await client.query(
             `UPDATE game_attempts SET status='cancelled', ended_at=now() WHERE assignment_id=$1 AND status='in_progress'`,
@@ -562,9 +594,19 @@ huntRouter.post(
       }
       const row = assignment.rows[0];
 
-      const roundResult = await client.query<{ id: string; difficulty: Difficulty; game_id: string | null }>(
-        `SELECT id, difficulty, game_id FROM rounds WHERE id=$1`,
-        [row.round_id],
+      const roundResult = await client.query<{
+        id: string;
+        difficulty: Difficulty;
+        game_id: string | null;
+        team_game_override: boolean;
+      }>(
+        `SELECT r.id, r.difficulty,
+                CASE WHEN trg.team_id IS NULL THEN r.game_id ELSE trg.game_id END AS game_id,
+                (trg.team_id IS NOT NULL) AS team_game_override
+         FROM rounds r
+         LEFT JOIN team_round_game_mappings trg ON trg.team_id=$2 AND trg.round_id=r.id
+         WHERE r.id=$1`,
+        [row.round_id, participant.teamId],
       );
       if (!roundResult.rows[0]) {
         throw new HttpError(404, 'ROUND_NOT_FOUND', 'Round not found.');
@@ -576,6 +618,7 @@ huntRouter.post(
         roundResult.rows[0].difficulty,
         roundResult.rows[0].game_id,
         row.round_id,
+        roundResult.rows[0].team_game_override,
       );
 
       // Cancel any in-progress attempt on old game
