@@ -469,6 +469,7 @@ huntRouter.post(
           ...inserted.rows[0]!,
           game_enabled: true,
           round_mapped_game_id: currentRound.game_id,
+          team_game_override: currentRound.team_game_override,
           team_id: participant.teamId,
           round_id: currentRound.id,
           difficulty: currentRound.difficulty,
