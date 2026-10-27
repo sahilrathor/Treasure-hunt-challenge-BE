@@ -784,7 +784,10 @@ huntRouter.post(
       SELECT a.id,a.status,g.code game_code,g.name game_name,r.difficulty,l.config,a.public_challenge,a.secret_challenge,l.max_attempts,l.cooldown_seconds,r.sequence round_sequence,c.label checkpoint_label,
         x.id attempt_id,x.status attempt_status,x.started_at,x.participant_id,x.team_id,x.result_metadata,x.submit_idempotency_key,x.duration_ms,
         COALESCE((e.settings->>'roundCount')::int, (e.settings->>'checkpointCount')::int, 8) checkpoint_count
-      FROM game_attempts x JOIN game_assignments a ON a.id=x.assignment_id JOIN games g ON g.id=a.game_id JOIN game_levels l ON l.id=a.game_level_id JOIN rounds r ON r.id=a.round_id JOIN checkpoints c ON c.id=r.checkpoint_id JOIN teams t ON t.id=x.team_id JOIN events e ON e.id=t.event_id
+      FROM game_attempts x JOIN game_assignments a ON a.id=x.assignment_id JOIN games g ON g.id=a.game_id JOIN game_levels l ON l.id=a.game_level_id JOIN rounds r ON r.id=a.round_id
+      LEFT JOIN team_round_locations trl ON trl.team_id=x.team_id AND trl.round_sequence=r.sequence
+      JOIN checkpoints c ON c.id=COALESCE(trl.checkpoint_id,r.checkpoint_id)
+      JOIN teams t ON t.id=x.team_id JOIN events e ON e.id=t.event_id
       WHERE x.id=$1 FOR UPDATE OF x,a
     `,
         [attemptId],
