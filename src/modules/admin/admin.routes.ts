@@ -1111,50 +1111,60 @@ adminRouter.patch(
            WHERE trl.team_id = t.id AND t.event_id = $1 AND trl.round_sequence > $2`,
           [eventId, targetRoundCount],
         );
-      } else if (targetRoundCount > prevRoundCount) {
-        const availableCps = await client.query<{ id: string }>(
-          `SELECT id FROM checkpoints WHERE event_id=$1 AND active ORDER BY NULLIF(regexp_replace(code, '\\D', '', 'g'), '')::int NULLS LAST, code, created_at`,
-          [eventId],
-        );
-        for (let seq = prevRoundCount + 1; seq <= targetRoundCount; seq += 1) {
-          const difficulty =
-            seq <= Math.ceil(targetRoundCount / 3)
-              ? 'easy'
-              : seq <= Math.ceil((targetRoundCount * 2) / 3)
-                ? 'medium'
-                : 'hard';
-          const defaultCpId = availableCps.rows.length
-            ? availableCps.rows[(seq - 1) % availableCps.rows.length]!.id
-            : null;
-          await client.query(
-            `INSERT INTO rounds(event_id,checkpoint_id,sequence,clue,difficulty)
-             VALUES ($1,$2,$3,$4,$5)`,
-            [
-              eventId,
-              defaultCpId,
-              seq,
-              `Proceed to your assigned location for Round ${seq}.`,
-              difficulty,
-            ],
-          );
-        }
+      }
 
-        // Auto-seed team_round_locations for existing teams for new sequences
+      // Reconcile actual round rows against the configured count. Settings can be correct
+      // even when round rows were removed or have gaps, so do not rely on settings deltas.
+      const configuredRounds = await client.query<{ sequence: number }>(
+        `SELECT sequence FROM rounds WHERE event_id=$1`,
+        [eventId],
+      );
+      const existingSequences = new Set(configuredRounds.rows.map((round) => round.sequence));
+      const availableCps = await client.query<{ id: string }>(
+        `SELECT id FROM checkpoints WHERE event_id=$1 AND active ORDER BY NULLIF(regexp_replace(code, '\\D', '', 'g'), '')::int NULLS LAST, code, created_at`,
+        [eventId],
+      );
+
+      for (let seq = 1; seq <= targetRoundCount; seq += 1) {
+        if (existingSequences.has(seq)) continue;
+        const difficulty =
+          seq <= Math.ceil(targetRoundCount / 3)
+            ? 'easy'
+            : seq <= Math.ceil((targetRoundCount * 2) / 3)
+              ? 'medium'
+              : 'hard';
+        const defaultCpId = availableCps.rows.length
+          ? availableCps.rows[(seq - 1) % availableCps.rows.length]!.id
+          : null;
+        await client.query(
+          `INSERT INTO rounds(event_id,checkpoint_id,sequence,clue,difficulty)
+           VALUES ($1,$2,$3,$4,$5)
+           ON CONFLICT (event_id, sequence) DO NOTHING`,
+          [
+            eventId,
+            defaultCpId,
+            seq,
+            `Proceed to your assigned location for Round ${seq}.`,
+            difficulty,
+          ],
+        );
+      }
+
+      // Preserve existing team routes and fill any missing team/round route rows.
+      if (availableCps.rows.length > 0) {
         const existingTeams = await client.query<{ id: string }>(
           `SELECT id FROM teams WHERE event_id=$1 AND active`,
           [eventId],
         );
-        if (availableCps.rows.length > 0) {
-          for (const t of existingTeams.rows) {
-            for (let seq = prevRoundCount + 1; seq <= targetRoundCount; seq += 1) {
-              const cp = availableCps.rows[(seq - 1) % availableCps.rows.length]!;
-              await client.query(
-                `INSERT INTO team_round_locations(team_id, round_sequence, checkpoint_id)
-                 VALUES ($1, $2, $3)
-                 ON CONFLICT (team_id, round_sequence) DO NOTHING`,
-                [t.id, seq, cp.id],
-              );
-            }
+        for (const team of existingTeams.rows) {
+          for (let seq = 1; seq <= targetRoundCount; seq += 1) {
+            const checkpoint = availableCps.rows[(seq - 1) % availableCps.rows.length]!;
+            await client.query(
+              `INSERT INTO team_round_locations(team_id, round_sequence, checkpoint_id)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (team_id, round_sequence) DO NOTHING`,
+              [team.id, seq, checkpoint.id],
+            );
           }
         }
       }
