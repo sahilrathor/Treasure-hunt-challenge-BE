@@ -146,7 +146,7 @@ adminRouter.get(
         `SELECT c.id, c.code, c.label, c.clue, c.note, c.show_note_to_player, c.qr_token, c.active
          FROM checkpoints c
          WHERE c.event_id=$1 AND c.active
-         ORDER BY c.code, c.created_at`,
+         ORDER BY NULLIF(regexp_replace(c.code, '\\D', '', 'g'), '')::int NULLS LAST, c.code, c.created_at`,
         [current.id],
       ),
       query<{
@@ -275,8 +275,8 @@ adminRouter.post(
     const input = z
       .object({
         roundCount: z.number().int().min(1).max(16).optional(),
-        locationCount: z.number().int().min(1).max(20).optional(),
-        checkpointCount: z.number().int().min(1).max(20).optional(),
+        locationCount: z.number().int().min(1).max(100).optional(),
+        checkpointCount: z.number().int().min(1).max(100).optional(),
       })
       .parse(request.body);
 
@@ -461,7 +461,7 @@ adminRouter.post(
 
       // Automatically assign initial locations for each round sequence
       const existingCps = await client.query<{ id: string }>(
-        `SELECT id FROM checkpoints WHERE event_id=$1 AND active ORDER BY code, created_at`,
+        `SELECT id FROM checkpoints WHERE event_id=$1 AND active ORDER BY NULLIF(regexp_replace(code, '\\D', '', 'g'), '')::int NULLS LAST, code, created_at`,
         [input.eventId],
       );
       const existingRounds = await client.query<{ id: string; sequence: number }>(
@@ -979,8 +979,8 @@ adminRouter.patch(
     const input = z
       .object({
         roundCount: z.number().int().min(1).max(16).optional(),
-        locationCount: z.number().int().min(1).max(20).optional(),
-        checkpointCount: z.number().int().min(1).max(20).optional(),
+        locationCount: z.number().int().min(1).max(100).optional(),
+        checkpointCount: z.number().int().min(1).max(100).optional(),
       })
       .parse(request.body);
 
@@ -1014,7 +1014,7 @@ adminRouter.patch(
 
       // 1. Handle locationCount changes
       const allExistingCps = await client.query<{ id: string; code: string }>(
-        `SELECT id, code FROM checkpoints WHERE event_id=$1 AND active ORDER BY code, created_at`,
+        `SELECT id, code FROM checkpoints WHERE event_id=$1 AND active ORDER BY NULLIF(regexp_replace(code, '\\D', '', 'g'), '')::int NULLS LAST, code, created_at`,
         [eventId],
       );
       const currentLocCount = allExistingCps.rows.length;
@@ -1113,7 +1113,7 @@ adminRouter.patch(
         );
       } else if (targetRoundCount > prevRoundCount) {
         const availableCps = await client.query<{ id: string }>(
-          `SELECT id FROM checkpoints WHERE event_id=$1 AND active ORDER BY code, created_at`,
+          `SELECT id FROM checkpoints WHERE event_id=$1 AND active ORDER BY NULLIF(regexp_replace(code, '\\D', '', 'g'), '')::int NULLS LAST, code, created_at`,
           [eventId],
         );
         for (let seq = prevRoundCount + 1; seq <= targetRoundCount; seq += 1) {
@@ -1171,7 +1171,7 @@ adminRouter.patch(
       );
 
       const allCps = await client.query<{ id: string; label: string; code: string }>(
-        `SELECT id, label, code FROM checkpoints WHERE event_id=$1 AND active ORDER BY code, created_at`,
+        `SELECT id, label, code FROM checkpoints WHERE event_id=$1 AND active ORDER BY NULLIF(regexp_replace(code, '\\D', '', 'g'), '')::int NULLS LAST, code, created_at`,
         [eventId],
       );
 
